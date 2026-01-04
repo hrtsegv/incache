@@ -63,7 +63,7 @@ func TestNotFoundSetWithTimeout(t *testing.T) {
 		t.Error("Expected NotFoundSetWithTimeout to return true for a new key with timeout")
 	}
 
-	time.Sleep(c.timeInterval + timeout)
+	time.Sleep(c.cleanupInterval + timeout)
 
 	_, ok = c.Get("key2")
 	if ok {

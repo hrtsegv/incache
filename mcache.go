@@ -6,11 +6,11 @@ import (
 )
 
 type MCache[K comparable, V any] struct {
-	mu           sync.RWMutex
-	size         uint
-	m            map[K]valueWithTimeout[V] // where the key-value pairs are stored
-	stopCh       chan struct{}             // Channel to signal timeout goroutine to stop
-	timeInterval time.Duration             // Time interval to sleep the goroutine that checks for expired keys
+	mu              sync.RWMutex
+	size            uint
+	m               map[K]valueWithTimeout[V] // where the key-value pairs are stored
+	stopCh          chan struct{}             // Channel to signal timeout goroutine to stop
+	cleanupInterval time.Duration             // Time interval to sleep the goroutine that checks for expired keys
 }
 
 type valueWithTimeout[V any] struct {
@@ -27,12 +27,12 @@ func NewManual[K comparable, V any](size uint, opts ...Option) *MCache[K, V] {
 	}
 
 	c := &MCache[K, V]{
-		m:            make(map[K]valueWithTimeout[V]),
-		stopCh:       make(chan struct{}),
-		size:         size,
-		timeInterval: o.CleanupInterval,
+		m:               make(map[K]valueWithTimeout[V]),
+		stopCh:          make(chan struct{}),
+		size:            size,
+		cleanupInterval: o.CleanupInterval,
 	}
-	if c.timeInterval > 0 {
+	if c.cleanupInterval > 0 {
 		go c.expireKeys()
 	}
 	return c
@@ -226,7 +226,7 @@ func (c *MCache[K, V]) Keys() []K {
 // It runs until the Close method is called.
 // This function is not intended to be called directly by users.
 func (c *MCache[K, V]) expireKeys() {
-	ticker := time.NewTicker(c.timeInterval)
+	ticker := time.NewTicker(c.cleanupInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -252,7 +252,7 @@ func (c *MCache[K, V]) Purge() {
 }
 
 func (c *MCache[K, V]) Close() {
-	if c.timeInterval > 0 {
+	if c.cleanupInterval > 0 {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		select {
