@@ -24,7 +24,8 @@ import (
 
 func main() {
 	// create a new LRU Cache
-	c := incache.NewLRU[string, int](10)
+	var c incache.Cache[string, int]
+	c = incache.NewLRU[string, int](10)
 
 	fmt.Println("keys:", c.Keys())
 

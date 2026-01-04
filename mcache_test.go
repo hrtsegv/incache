@@ -203,29 +203,29 @@ func TestKeys(t *testing.T) {
 	}
 }
 
-func TestPurge(t *testing.T) {
+func TestClose(t *testing.T) {
 	c := NewManual[string, string](10, time.Millisecond*100)
 
 	c.Set("key1", "value1")
-	c.Set("key2", "value2")
-	c.SetWithTimeout("key3", "value3", 1)
-	c.SetWithTimeout("key4", "value4", 1)
-	c.SetWithTimeout("key5", "value5", 1)
-	c.Set("key6", "value6")
-
-	c.Purge()
+	c.Close()
 
 	select {
 	case _, ok := <-c.stopCh:
 		if ok {
 			t.Errorf("Close: expiration goroutine did not stop as expected")
 		}
-	default:
-		t.Errorf("Close: expiration goroutine did not stop as expected")
+	case <-time.After(time.Second):
+		t.Errorf("Close: timeout waiting for stopCh to close")
 	}
+}
 
-	if len(c.m) != 0 {
-		t.Errorf("Close: database map is not cleaned up")
+func TestPurge(t *testing.T) {
+	c := NewManual[string, string](10, 0)
+	c.Set("key1", "value1")
+	c.Set("key2", "value2")
+	c.Purge()
+	if c.Len() != 0 {
+		t.Errorf("Purge: expected length 0, got %d", c.Len())
 	}
 }
 

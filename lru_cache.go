@@ -135,7 +135,7 @@ func (c *LRUCache[K, V]) delete(k K) {
 }
 
 // TransferTo transfers all non-expired key-value pairs from the source cache to the destination cache.
-func (src *LRUCache[K, V]) TransferTo(dst *LRUCache[K, V]) {
+func (src *LRUCache[K, V]) TransferTo(dst Cache[K, V]) {
 	src.mu.Lock()
 	defer src.mu.Unlock()
 
@@ -149,7 +149,7 @@ func (src *LRUCache[K, V]) TransferTo(dst *LRUCache[K, V]) {
 }
 
 // CopyTo copies all non-expired key-value pairs from the source cache to the destination cache.
-func (src *LRUCache[K, V]) CopyTo(dst *LRUCache[K, V]) {
+func (src *LRUCache[K, V]) CopyTo(dst Cache[K, V]) {
 	src.mu.Lock()
 	defer src.mu.Unlock()
 
@@ -167,7 +167,7 @@ func (c *LRUCache[K, V]) Keys() []K {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	keys := make([]K, 0, c.Count())
+	keys := make([]K, 0, len(c.m))
 
 	for k, v := range c.m {
 		if lruItem := v.Value.(*lruItem[K, V]); lruItem.expireAt == nil || !lruItem.expireAt.Before(time.Now()) {
@@ -186,6 +186,8 @@ func (c *LRUCache[K, V]) Purge() {
 	c.m = make(map[K]*list.Element)
 	c.evictionList.Init()
 }
+
+func (c *LRUCache[K, V]) Close() {}
 
 // Count returns the number of non-expired key-value pairs currently stored in the cache.
 func (c *LRUCache[K, V]) Count() int {
@@ -211,6 +213,9 @@ func (c *LRUCache[K, V]) Len() int {
 }
 
 func (c *LRUCache[K, V]) set(k K, v V, exp time.Duration) {
+	if c.size == 0 {
+		return
+	}
 	item, ok := c.m[k]
 	var tm *time.Time
 	if exp > 0 {

@@ -18,8 +18,8 @@ type valueWithTimeout[V any] struct {
 	expireAt *time.Time
 }
 
-// New creates a new cache instance with optional configuration provided by the specified options.
-// The database starts a background goroutine to periodically check for expired keys based on the configured time interval.
+// NewManual creates a new cache instance with the specified size and expiration check interval.
+// If timeInterval is greater than zero, a background goroutine is started to periodically check for and remove expired keys.
 func NewManual[K comparable, V any](size uint, timeInterval time.Duration) *MCache[K, V] {
 	c := &MCache[K, V]{
 		m:            make(map[K]valueWithTimeout[V]),
@@ -179,7 +179,7 @@ func (c *MCache[K, V]) Delete(k K) {
 //
 // The source cache and the destination cache are locked during the entire operation.
 // The function is safe to call concurrently with other operations on any of the source cache or destination cache.
-func (src *MCache[K, V]) TransferTo(dst *MCache[K, V]) {
+func (src *MCache[K, V]) TransferTo(dst Cache[K, V]) {
 	all := src.GetAll()
 	src.mu.Lock()
 	src.m = make(map[K]valueWithTimeout[V])
@@ -194,7 +194,7 @@ func (src *MCache[K, V]) TransferTo(dst *MCache[K, V]) {
 //
 // The source cache are the destination cache are locked during the entire operation.
 // The function is safe to call concurrently with other operations on any of the source cache or Destination cache.
-func (src *MCache[K, V]) CopyTo(dst *MCache[K, V]) {
+func (src *MCache[K, V]) CopyTo(dst Cache[K, V]) {
 	all := src.GetAll()
 
 	for k, v := range all {
@@ -206,7 +206,7 @@ func (c *MCache[K, V]) Keys() []K {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	keys := make([]K, 0, c.Count())
+	keys := make([]K, 0, len(c.m))
 
 	for k, v := range c.m {
 		if v.expireAt == nil || !v.expireAt.Before(time.Now()) {
@@ -218,7 +218,7 @@ func (c *MCache[K, V]) Keys() []K {
 }
 
 // expireKeys is a background goroutine that periodically checks for expired keys and removes them from the database.
-// It runs until the Close method is callec.
+// It runs until the Close method is called.
 // This function is not intended to be called directly by users.
 func (c *MCache[K, V]) expireKeys() {
 	ticker := time.NewTicker(c.timeInterval)
@@ -226,13 +226,14 @@ func (c *MCache[K, V]) expireKeys() {
 	for {
 		select {
 		case <-ticker.C:
+			now := time.Now()
+			c.mu.Lock()
 			for k, v := range c.m {
-				if v.expireAt != nil && v.expireAt.Before(time.Now()) {
-					c.mu.Lock()
+				if v.expireAt != nil && v.expireAt.Before(now) {
 					delete(c.m, k)
-					c.mu.Unlock()
 				}
 			}
+			c.mu.Unlock()
 		case <-c.stopCh:
 			return
 		}
@@ -240,11 +241,22 @@ func (c *MCache[K, V]) expireKeys() {
 }
 
 func (c *MCache[K, V]) Purge() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m = make(map[K]valueWithTimeout[V])
+}
+
+func (c *MCache[K, V]) Close() {
 	if c.timeInterval > 0 {
-		c.stopCh <- struct{}{} // Signal the expiration goroutine to stop
-		close(c.stopCh)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		select {
+		case <-c.stopCh:
+			// already closed
+		default:
+			close(c.stopCh)
+		}
 	}
-	c.m = nil
 }
 
 // Count returns the number of key-value pairs in the database.

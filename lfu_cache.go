@@ -2,24 +2,18 @@ package incache
 
 import (
 	"container/list"
+	"fmt"
 	"sync"
 	"time"
 )
 
 // Least Frequently Used Cache
 type LFUCache[K comparable, V any] struct {
-	mu           sync.RWMutex
-	size         uint
-	m            map[K]*list.Element
-	evictionList *list.List
-}
-
-func NewLFU[K comparable, V any](size uint) *LFUCache[K, V] {
-	return &LFUCache[K, V]{
-		size:         size,
-		m:            make(map[K]*list.Element),
-		evictionList: list.New(),
-	}
+	mu      sync.RWMutex
+	size    uint
+	m       map[K]*list.Element
+	freqs   map[uint]*list.List
+	minFreq uint
 }
 
 type lfuItem[K comparable, V any] struct {
@@ -29,248 +23,265 @@ type lfuItem[K comparable, V any] struct {
 	expireAt *time.Time
 }
 
-// Set adds the key-value pair to the cache.
+func NewLFU[K comparable, V any](size uint) *LFUCache[K, V] {
+	return &LFUCache[K, V]{
+		size:  size,
+		m:     make(map[K]*list.Element),
+		freqs: make(map[uint]*list.List),
+	}
+}
+
 func (l *LFUCache[K, V]) Set(key K, value V) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
 	l.set(key, value, 0)
 }
 
-// SetWithTimeout adds the key-value pair to the cache with a specified expiration time.
 func (l *LFUCache[K, V]) SetWithTimeout(key K, value V, exp time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
 	l.set(key, value, exp)
 }
 
 func (l *LFUCache[K, V]) set(key K, value V, exp time.Duration) {
-	item, ok := l.m[key]
+	if l.size == 0 {
+		return
+	}
+
 	var tm *time.Time
 	if exp > 0 {
 		t := time.Now().Add(exp)
 		tm = &t
 	}
-	if ok {
-		lfuItem := item.Value.(*lfuItem[K, V])
 
-		lfuItem.value = value
-		lfuItem.expireAt = tm
-		lfuItem.freq++
-
-		l.move(item)
-	} else {
-		if len(l.m) == int(l.size) {
-			l.evict(1)
-		}
-
-		lfuItem := lfuItem[K, V]{
-			key:      key,
-			value:    value,
-			expireAt: tm,
-			freq:     1,
-		}
-
-		l.m[key] = l.evictionList.PushBack(&lfuItem)
-		l.move(l.m[key])
+	if elem, ok := l.m[key]; ok {
+		item := elem.Value.(*lfuItem[K, V])
+		item.value = value
+		item.expireAt = tm
+		l.incrementFreq(elem)
+		return
 	}
+
+	if len(l.m) >= int(l.size) {
+		l.evict(1)
+	}
+
+	item := &lfuItem[K, V]{
+		key:      key,
+		value:    value,
+		freq:     1,
+		expireAt: tm,
+	}
+	l.minFreq = 1
+	if _, ok := l.freqs[1]; !ok {
+		l.freqs[1] = list.New()
+	}
+	l.m[key] = l.freqs[1].PushFront(item)
 }
 
-// Get retrieves the value associated with the given key from the cache.
-// If the key is not found or has expired, it returns (zero value of V, false).
-// Otherwise, it returns (value, true).
 func (l *LFUCache[K, V]) Get(key K) (v V, b bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	item, ok := l.m[key]
+	elem, ok := l.m[key]
 	if !ok {
 		return
 	}
 
-	lfuItem := item.Value.(*lfuItem[K, V])
-	if lfuItem.expireAt != nil && lfuItem.expireAt.Before(time.Now()) {
-		l.delete(key, item)
+	item := elem.Value.(*lfuItem[K, V])
+	if item.expireAt != nil && item.expireAt.Before(time.Now()) {
+		l.removeElement(elem)
 		return
 	}
 
-	lfuItem.freq++
-	l.move(item)
-
-	return lfuItem.value, true
+	l.incrementFreq(elem)
+	return item.value, true
 }
 
-// NotFoundSet adds the key-value pair to the cache only if the key does not exist.
-// It returns true if the key was added to the cache, otherwise false.
+func (l *LFUCache[K, V]) incrementFreq(elem *list.Element) {
+	item := elem.Value.(*lfuItem[K, V])
+	oldFreq := item.freq
+	l.freqs[oldFreq].Remove(elem)
+
+	if l.freqs[oldFreq].Len() == 0 {
+		delete(l.freqs, oldFreq)
+		if l.minFreq == oldFreq {
+			l.minFreq++
+		}
+	}
+
+	item.freq++
+	if _, ok := l.freqs[item.freq]; !ok {
+		l.freqs[item.freq] = list.New()
+	}
+	l.m[item.key] = l.freqs[item.freq].PushFront(item)
+}
+
 func (l *LFUCache[K, V]) NotFoundSet(k K, v V) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	_, ok := l.m[k]
-	if ok {
+	if _, ok := l.m[k]; ok {
 		return false
 	}
-
 	l.set(k, v, 0)
 	return true
 }
 
-// NotFoundSetWithTimeout adds the key-value pair to the cache only if the key does not exist.
-// It sets an expiration time for the key-value pair.
-// It returns true if the key was added to the cache, otherwise false.
 func (l *LFUCache[K, V]) NotFoundSetWithTimeout(k K, v V, t time.Duration) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	_, ok := l.m[k]
-	if ok {
+	if _, ok := l.m[k]; ok {
 		return false
 	}
-
 	l.set(k, v, t)
 	return true
 }
 
-// GetAll retrieves all key-value pairs from the cache.
-// It returns a map containing all the key-value pairs that are not expired.
 func (l *LFUCache[K, V]) GetAll() map[K]V {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
 	m := make(map[K]V)
-	for k, v := range l.m {
-		if lfuItem := v.Value.(*lfuItem[K, V]); lfuItem.expireAt == nil || !lfuItem.expireAt.Before(time.Now()) {
-			m[k] = lfuItem.value
+	now := time.Now()
+	for k, elem := range l.m {
+		item := elem.Value.(*lfuItem[K, V])
+		if item.expireAt == nil || !item.expireAt.Before(now) {
+			m[k] = item.value
 		}
 	}
-
 	return m
 }
 
-// TransferTo transfers all non-expired key-value pairs from the source cache to the destination cache.
-func (src *LFUCache[K, V]) TransferTo(dst *LFUCache[K, V]) {
+func (src *LFUCache[K, V]) TransferTo(dst Cache[K, V]) {
 	src.mu.Lock()
 	defer src.mu.Unlock()
 
-	for k, v := range src.m {
-		if lfuItem := v.Value.(*lfuItem[K, V]); lfuItem.expireAt == nil || !lfuItem.expireAt.Before(time.Now()) {
-			src.delete(k, v)
-			dst.Set(k, lfuItem.value)
+	now := time.Now()
+	for k, elem := range src.m {
+		item := elem.Value.(*lfuItem[K, V])
+		if item.expireAt == nil || !item.expireAt.Before(now) {
+			src.removeElement(elem)
+			dst.Set(k, item.value)
 		}
 	}
 }
 
-// CopyTo copies all non-expired key-value pairs from the source cache to the destination cache.
-func (src *LFUCache[K, V]) CopyTo(dst *LFUCache[K, V]) {
+func (src *LFUCache[K, V]) CopyTo(dst Cache[K, V]) {
 	src.mu.RLock()
 	defer src.mu.RUnlock()
 
-	for k, v := range src.m {
-		if lfuItem := v.Value.(*lfuItem[K, V]); lfuItem.expireAt == nil || !lfuItem.expireAt.Before(time.Now()) {
-			dst.Set(k, lfuItem.value)
+	now := time.Now()
+	for k, elem := range src.m {
+		item := elem.Value.(*lfuItem[K, V])
+		if item.expireAt == nil || !item.expireAt.Before(now) {
+			dst.Set(k, item.value)
 		}
 	}
 }
 
-// Keys returns a slice of all keys currently stored in the cache.
-// The returned slice does not include expired keys.
-// The order of keys in the slice is not guaranteed.
 func (l *LFUCache[K, V]) Keys() []K {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	keys := make([]K, 0, l.Count())
-
-	for k, v := range l.m {
-		if lfuItem := v.Value.(*lfuItem[K, V]); lfuItem.expireAt == nil || !lfuItem.expireAt.Before(time.Now()) {
+	keys := make([]K, 0, len(l.m))
+	now := time.Now()
+	for k, elem := range l.m {
+		item := elem.Value.(*lfuItem[K, V])
+		if item.expireAt == nil || !item.expireAt.Before(now) {
 			keys = append(keys, k)
 		}
 	}
-
 	return keys
 }
 
-// Purge removes all key-value pairs from the cache.
 func (l *LFUCache[K, V]) Purge() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
 	l.m = make(map[K]*list.Element)
-	l.evictionList.Init()
+	l.freqs = make(map[uint]*list.List)
+	l.minFreq = 0
 }
 
-// Count returns the number of non-expired key-value pairs currently stored in the cache.
+func (l *LFUCache[K, V]) Close() {}
+
 func (l *LFUCache[K, V]) Count() int {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
 	var count int
-	for _, v := range l.m {
-		if lfuItem := v.Value.(*lfuItem[K, V]); lfuItem.expireAt == nil || !lfuItem.expireAt.Before(time.Now()) {
+	now := time.Now()
+	for _, elem := range l.m {
+		item := elem.Value.(*lfuItem[K, V])
+		if item.expireAt == nil || !item.expireAt.Before(now) {
 			count++
 		}
 	}
-
 	return count
 }
 
-// Len returns the number of elements in the cache.
 func (l *LFUCache[K, V]) Len() int {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-
 	return len(l.m)
 }
 
-// Delete removes the key-value pair associated with the given key from the cache.
 func (l *LFUCache[K, V]) Delete(k K) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	item, ok := l.m[k]
-	if !ok {
-		return
+	if elem, ok := l.m[k]; ok {
+		l.removeElement(elem)
 	}
-
-	l.delete(k, item)
 }
 
-func (l *LFUCache[K, V]) delete(key K, elem *list.Element) {
-	delete(l.m, key)
-	l.evictionList.Remove(elem)
+func (l *LFUCache[K, V]) removeElement(elem *list.Element) {
+	item := elem.Value.(*lfuItem[K, V])
+	delete(l.m, item.key)
+	l.freqs[item.freq].Remove(elem)
+	if l.freqs[item.freq].Len() == 0 {
+		delete(l.freqs, item.freq)
+		if l.minFreq == item.freq {
+			// This might be tricky, but we only really care about minFreq during eviction
+			// and minFreq will be reset to 1 on new Set.
+		}
+	}
 }
 
 func (l *LFUCache[K, V]) evict(n int) {
 	for i := 0; i < n; i++ {
-		if b := l.evictionList.Back(); b != nil {
-			delete(l.m, b.Value.(*lfuItem[K, V]).key)
-			l.evictionList.Remove(b)
-		} else {
+		if len(l.m) == 0 {
 			return
 		}
+		for l.freqs[l.minFreq] == nil || l.freqs[l.minFreq].Len() == 0 {
+			l.minFreq++
+		}
+		list := l.freqs[l.minFreq]
+		elem := list.Back()
+		l.removeElement(elem)
 	}
 }
 
-func (l *LFUCache[K, V]) move(elem *list.Element) {
-	item := elem.Value.(*lfuItem[K, V])
-	freq := item.freq
+func (l *LFUCache[K, V]) Inspect() {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
-	curr := elem
-	for ; curr.Prev() != nil; curr = curr.Prev() {
-		if freq < curr.Value.(*lfuItem[K, V]).freq {
-			break
+	// Iterate through frequencies in ascending order
+	var freqs []uint
+	for f := range l.freqs {
+		freqs = append(freqs, f)
+	}
+	// Sort frequencies
+	for i := 0; i < len(freqs); i++ {
+		for j := i + 1; j < len(freqs); j++ {
+			if freqs[i] > freqs[j] {
+				freqs[i], freqs[j] = freqs[j], freqs[i]
+			}
 		}
 	}
 
-	if curr == elem {
-		return
+	for _, f := range freqs {
+		for elem := l.freqs[f].Front(); elem != nil; elem = elem.Next() {
+			item := elem.Value.(*lfuItem[K, V])
+			fmt.Printf("key: %v, value: %v, expireAt: %v, freq: %v\n", item.key, item.value, item.expireAt, item.freq)
+		}
 	}
-
-	if curr.Value.(*lfuItem[K, V]).freq == freq {
-		l.evictionList.MoveToFront(elem)
-		return
-	}
-
-	l.evictionList.MoveAfter(elem, curr)
 }
