@@ -14,18 +14,33 @@ type lruItem[K comparable, V any] struct {
 
 // Least Recently Used Cache
 type LRUCache[K comparable, V any] struct {
-	mu           sync.RWMutex
-	size         uint
-	m            map[K]*list.Element // where the key-value pairs are stored
-	evictionList *list.List
+	mu              sync.RWMutex
+	size            uint
+	m               map[K]*list.Element // where the key-value pairs are stored
+	evictionList    *list.List
+	stopCh          chan struct{}
+	cleanupInterval time.Duration
 }
 
-func NewLRU[K comparable, V any](size uint) *LRUCache[K, V] {
-	return &LRUCache[K, V]{
-		size:         size,
-		m:            make(map[K]*list.Element),
-		evictionList: list.New(),
+func NewLRU[K comparable, V any](size uint, opts ...Option) *LRUCache[K, V] {
+	o := &Options{}
+	for _, opt := range opts {
+		opt(o)
 	}
+
+	c := &LRUCache[K, V]{
+		size:            size,
+		m:               make(map[K]*list.Element),
+		evictionList:    list.New(),
+		stopCh:          make(chan struct{}),
+		cleanupInterval: o.CleanupInterval,
+	}
+
+	if c.cleanupInterval > 0 {
+		go c.expireKeys()
+	}
+
+	return c
 }
 
 // Get retrieves the value associated with the given key from the cache.
@@ -187,7 +202,39 @@ func (c *LRUCache[K, V]) Purge() {
 	c.evictionList.Init()
 }
 
-func (c *LRUCache[K, V]) Close() {}
+func (c *LRUCache[K, V]) Close() {
+	if c.cleanupInterval > 0 {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		select {
+		case <-c.stopCh:
+			// already closed
+		default:
+			close(c.stopCh)
+		}
+	}
+}
+
+func (c *LRUCache[K, V]) expireKeys() {
+	ticker := time.NewTicker(c.cleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			c.mu.Lock()
+			for k, v := range c.m {
+				item := v.Value.(*lruItem[K, V])
+				if item.expireAt != nil && item.expireAt.Before(now) {
+					c.delete(k)
+				}
+			}
+			c.mu.Unlock()
+		case <-c.stopCh:
+			return
+		}
+	}
+}
 
 // Count returns the number of non-expired key-value pairs currently stored in the cache.
 func (c *LRUCache[K, V]) Count() int {

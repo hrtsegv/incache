@@ -9,11 +9,13 @@ import (
 
 // Least Frequently Used Cache
 type LFUCache[K comparable, V any] struct {
-	mu      sync.RWMutex
-	size    uint
-	m       map[K]*list.Element
-	freqs   map[uint]*list.List
-	minFreq uint
+	mu              sync.RWMutex
+	size            uint
+	m               map[K]*list.Element
+	freqs           map[uint]*list.List
+	minFreq         uint
+	stopCh          chan struct{}
+	cleanupInterval time.Duration
 }
 
 type lfuItem[K comparable, V any] struct {
@@ -23,12 +25,25 @@ type lfuItem[K comparable, V any] struct {
 	expireAt *time.Time
 }
 
-func NewLFU[K comparable, V any](size uint) *LFUCache[K, V] {
-	return &LFUCache[K, V]{
-		size:  size,
-		m:     make(map[K]*list.Element),
-		freqs: make(map[uint]*list.List),
+func NewLFU[K comparable, V any](size uint, opts ...Option) *LFUCache[K, V] {
+	o := &Options{}
+	for _, opt := range opts {
+		opt(o)
 	}
+
+	c := &LFUCache[K, V]{
+		size:            size,
+		m:               make(map[K]*list.Element),
+		freqs:           make(map[uint]*list.List),
+		stopCh:          make(chan struct{}),
+		cleanupInterval: o.CleanupInterval,
+	}
+
+	if c.cleanupInterval > 0 {
+		go c.expireKeys()
+	}
+
+	return c
 }
 
 func (l *LFUCache[K, V]) Set(key K, value V) {
@@ -202,7 +217,39 @@ func (l *LFUCache[K, V]) Purge() {
 	l.minFreq = 0
 }
 
-func (l *LFUCache[K, V]) Close() {}
+func (l *LFUCache[K, V]) Close() {
+	if l.cleanupInterval > 0 {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		select {
+		case <-l.stopCh:
+			// already closed
+		default:
+			close(l.stopCh)
+		}
+	}
+}
+
+func (l *LFUCache[K, V]) expireKeys() {
+	ticker := time.NewTicker(l.cleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			l.mu.Lock()
+			for _, elem := range l.m {
+				item := elem.Value.(*lfuItem[K, V])
+				if item.expireAt != nil && item.expireAt.Before(now) {
+					l.removeElement(elem)
+				}
+			}
+			l.mu.Unlock()
+		case <-l.stopCh:
+			return
+		}
+	}
+}
 
 func (l *LFUCache[K, V]) Count() int {
 	l.mu.RLock()

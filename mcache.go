@@ -18,14 +18,19 @@ type valueWithTimeout[V any] struct {
 	expireAt *time.Time
 }
 
-// NewManual creates a new cache instance with the specified size and expiration check interval.
-// If timeInterval is greater than zero, a background goroutine is started to periodically check for and remove expired keys.
-func NewManual[K comparable, V any](size uint, timeInterval time.Duration) *MCache[K, V] {
+// NewManual creates a new cache instance with the specified size and options.
+// If a cleanup interval is provided via WithCleanupInterval, a background goroutine is started to periodically check for and remove expired keys.
+func NewManual[K comparable, V any](size uint, opts ...Option) *MCache[K, V] {
+	o := &Options{}
+	for _, opt := range opts {
+		opt(o)
+	}
+
 	c := &MCache[K, V]{
 		m:            make(map[K]valueWithTimeout[V]),
 		stopCh:       make(chan struct{}),
 		size:         size,
-		timeInterval: timeInterval,
+		timeInterval: o.CleanupInterval,
 	}
 	if c.timeInterval > 0 {
 		go c.expireKeys()

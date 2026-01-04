@@ -33,3 +33,18 @@ type Cache[K comparable, V any] interface {
 	// Close stops the background expiration goroutine if it's running.
 	Close()
 }
+
+// Options defines the configuration for a cache.
+type Options struct {
+	CleanupInterval time.Duration
+}
+
+// Option is a function that sets an option on the cache.
+type Option func(*Options)
+
+// WithCleanupInterval sets the interval at which the cache is checked for expired items.
+func WithCleanupInterval(interval time.Duration) Option {
+	return func(o *Options) {
+		o.CleanupInterval = interval
+	}
+}

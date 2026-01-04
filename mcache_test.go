@@ -7,7 +7,7 @@ import (
 )
 
 func TestSet(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 
 	c.Set("key1", "value1")
 	if c.m["key1"].value != "value1" {
@@ -16,7 +16,7 @@ func TestSet(t *testing.T) {
 }
 
 func TestNotFoundSet(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 
 	key := "key1"
 	value := "value1"
@@ -38,7 +38,7 @@ func TestNotFoundSet(t *testing.T) {
 }
 
 func TestNotFoundSetWithTimeout(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 	key := "key1"
 	value := "value1"
 	timeout := time.Second
@@ -77,7 +77,7 @@ func TestNotFoundSetWithTimeout(t *testing.T) {
 }
 
 func TestSetWithTimeout(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 	key := "test"
 	value := "test value"
 	timeout := time.Second
@@ -98,7 +98,7 @@ func TestSetWithTimeout(t *testing.T) {
 }
 
 func TestGet(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 
 	c.Set("key1", "value1")
 
@@ -114,7 +114,7 @@ func TestGet(t *testing.T) {
 }
 
 func TestGetAll(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 
 	c.Set("key1", "value1")
 	c.Set("key2", "value2")
@@ -132,7 +132,7 @@ func TestGetAll(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 
 	c.Set("key1", "value1")
 	c.Delete("key1")
@@ -144,8 +144,8 @@ func TestDelete(t *testing.T) {
 }
 
 func TestTransferTo(t *testing.T) {
-	src := NewManual[string, string](10, 0)
-	dst := NewManual[string, string](10, 0)
+	src := NewManual[string, string](10)
+	dst := NewManual[string, string](10)
 
 	src.Set("key1", "value1")
 	src.TransferTo(dst)
@@ -162,8 +162,8 @@ func TestTransferTo(t *testing.T) {
 }
 
 func TestCopyTo(t *testing.T) {
-	src := NewManual[string, string](10, 0)
-	dst := NewManual[string, string](10, 0)
+	src := NewManual[string, string](10)
+	dst := NewManual[string, string](10)
 
 	src.Set("key1", "value1")
 	src.CopyTo(dst)
@@ -180,7 +180,7 @@ func TestCopyTo(t *testing.T) {
 }
 
 func TestKeys(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 
 	c.Set("key1", "value1")
 	c.Set("key2", "value2")
@@ -204,7 +204,7 @@ func TestKeys(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
-	c := NewManual[string, string](10, time.Millisecond*100)
+	c := NewManual[string, string](10, WithCleanupInterval(time.Millisecond*100))
 
 	c.Set("key1", "value1")
 	c.Close()
@@ -220,7 +220,7 @@ func TestClose(t *testing.T) {
 }
 
 func TestPurge(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 	c.Set("key1", "value1")
 	c.Set("key2", "value2")
 	c.Purge()
@@ -230,7 +230,7 @@ func TestPurge(t *testing.T) {
 }
 
 func TestCount(t *testing.T) {
-	c := NewManual[int, string](10, 0)
+	c := NewManual[int, string](10)
 	c.Set(1, "one")
 	c.Set(2, "two")
 	c.SetWithTimeout(3, "three", time.Millisecond*100)
@@ -249,7 +249,7 @@ func TestCount(t *testing.T) {
 		t.Errorf("Count: expected: %d, got: %d", 2, count)
 	}
 
-	c = NewManual[int, string](10, 0)
+	c = NewManual[int, string](10)
 	c.Set(1, "one")
 	c.Set(2, "two")
 	c.SetWithTimeout(3, "three", time.Millisecond*100)
@@ -268,7 +268,7 @@ func TestCount(t *testing.T) {
 }
 
 func TestLen(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 	c.Set("1", "one")
 	c.Set("2", "two")
 	c.SetWithTimeout("3", "three", time.Millisecond*100)
@@ -278,7 +278,7 @@ func TestLen(t *testing.T) {
 		t.Errorf("Len: expected: %d, got: %d", 4, l)
 	}
 
-	c = NewManual[string, string](10, time.Millisecond*100)
+	c = NewManual[string, string](10, WithCleanupInterval(time.Millisecond*100))
 
 	c.Set("1", "one")
 	c.Set("2", "two")
@@ -293,7 +293,7 @@ func TestLen(t *testing.T) {
 }
 
 func TestEvict(t *testing.T) {
-	c := NewManual[string, string](10, 0)
+	c := NewManual[string, string](10)
 
 	c.Set("1", "one")
 	c.Set("2", "two")

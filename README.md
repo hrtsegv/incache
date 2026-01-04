@@ -23,9 +23,9 @@ import (
 )
 
 func main() {
-	// create a new LRU Cache
+	// create a new LRU Cache with background expiration check every minute
 	var c incache.Cache[string, int]
-	c = incache.NewLRU[string, int](10)
+	c = incache.NewLRU[string, int](10, incache.WithCleanupInterval(time.Minute))
 
 	fmt.Println("keys:", c.Keys())
 
