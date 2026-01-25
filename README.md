@@ -7,7 +7,7 @@ The `incache` package provides a simple cache implementation in Go. It can be us
 To use this package in your Go project, you can install it using `go get`:
 
 ```bash
-go get github.com/knbr13/incache
+go get github.com/aladdin-io/incache
 ```
 
 ### Example
@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/knbr13/incache"
+	"github.com/aladdin-io/incache"
 )
 
 func main() {
