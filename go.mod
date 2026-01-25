@@ -1,3 +1,3 @@
-module github.com/knbr13/incache
+module github.com/aladdin-io/incache
 
 go 1.25.5
