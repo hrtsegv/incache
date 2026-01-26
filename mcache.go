@@ -5,8 +5,11 @@ import (
 	"time"
 )
 
+// MCache is a simple cache with manual/no eviction policy.
+// When the cache is full and a new item needs to be added,
+// it first tries to evict expired items, then evicts random items if needed.
 type MCache[K comparable, V any] struct {
-	mu           sync.RWMutex
+	mu           sync.Mutex
 	size         uint
 	m            map[K]valueWithTimeout[V] // where the key-value pairs are stored
 	stopCh       chan struct{}             // Channel to signal timeout goroutine to stop
@@ -15,11 +18,12 @@ type MCache[K comparable, V any] struct {
 
 type valueWithTimeout[V any] struct {
 	value    V
-	expireAt *time.Time
+	expireAt int64 // Unix nano timestamp, 0 means no expiration
 }
 
-// New creates a new cache instance with optional configuration provided by the specified options.
-// The database starts a background goroutine to periodically check for expired keys based on the configured time interval.
+// NewManual creates a new cache instance with optional configuration provided by the specified options.
+// The cache starts a background goroutine to periodically check for expired keys based on the configured time interval.
+// If size is 0, the cache will not store any items.
 func NewManual[K comparable, V any](size uint, timeInterval time.Duration) *MCache[K, V] {
 	c := &MCache[K, V]{
 		m:            make(map[K]valueWithTimeout[V]),
@@ -44,17 +48,27 @@ func (c *MCache[K, V]) Set(k K, v V) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.m) == int(c.size) {
+	// If key exists, just update
+	if _, ok := c.m[k]; ok {
+		c.m[k] = valueWithTimeout[V]{
+			value:    v,
+			expireAt: 0,
+		}
+		return
+	}
+
+	if uint(len(c.m)) >= c.size {
 		c.evict(1)
 	}
 
 	c.m[k] = valueWithTimeout[V]{
 		value:    v,
-		expireAt: nil,
+		expireAt: 0,
 	}
 }
 
-// NotFoundSet adds a key-value pair to the database if the key does not already exist and returns true. Otherwise, it does nothing and returns false.
+// NotFoundSet adds a key-value pair to the database if the key does not already exist or is expired, and returns true.
+// Otherwise, it does nothing and returns false.
 func (c *MCache[K, V]) NotFoundSet(k K, v V) bool {
 	if c.size == 0 {
 		return false
@@ -63,18 +77,24 @@ func (c *MCache[K, V]) NotFoundSet(k K, v V) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	_, ok := c.m[k]
-	if !ok {
-		if len(c.m) == int(c.size) {
-			c.evict(1)
+	if val, ok := c.m[k]; ok {
+		// Check if existing key is expired
+		if val.expireAt == 0 || val.expireAt >= time.Now().UnixNano() {
+			return false
 		}
-
-		c.m[k] = valueWithTimeout[V]{
-			value:    v,
-			expireAt: nil,
-		}
+		// Key exists but is expired, delete it
+		delete(c.m, k)
 	}
-	return !ok
+
+	if uint(len(c.m)) >= c.size {
+		c.evict(1)
+	}
+
+	c.m[k] = valueWithTimeout[V]{
+		value:    v,
+		expireAt: 0,
+	}
+	return true
 }
 
 // SetWithTimeout adds or updates a key-value pair in the database with an expiration time.
@@ -84,27 +104,37 @@ func (c *MCache[K, V]) SetWithTimeout(k K, v V, timeout time.Duration) {
 	if c.size == 0 {
 		return
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var expireAt int64
 	if timeout > 0 {
-		c.mu.Lock()
-		defer c.mu.Unlock()
+		expireAt = time.Now().Add(timeout).UnixNano()
+	}
 
-		if len(c.m) == int(c.size) {
-			c.evict(1)
-		}
-
-		now := time.Now().Add(timeout)
+	// If key exists, just update
+	if _, ok := c.m[k]; ok {
 		c.m[k] = valueWithTimeout[V]{
 			value:    v,
-			expireAt: &now,
+			expireAt: expireAt,
 		}
-	} else {
-		c.Set(k, v)
+		return
+	}
+
+	if uint(len(c.m)) >= c.size {
+		c.evict(1)
+	}
+
+	c.m[k] = valueWithTimeout[V]{
+		value:    v,
+		expireAt: expireAt,
 	}
 }
 
-// NotFoundSetWithTimeout adds a key-value pair to the database with an expiration time if the key does not already exist and returns true. Otherwise, it does nothing and returns false.
+// NotFoundSetWithTimeout adds a key-value pair to the database with an expiration time if the key does not already exist or is expired, and returns true.
+// Otherwise, it does nothing and returns false.
 // If the timeout is zero or negative, the key-value pair will not have an expiration time.
-// If expiry is disabled, it behaves like NotFoundSet.
 func (c *MCache[K, V]) NotFoundSetWithTimeout(k K, v V, timeout time.Duration) bool {
 	if c.size == 0 {
 		return false
@@ -113,103 +143,133 @@ func (c *MCache[K, V]) NotFoundSetWithTimeout(k K, v V, timeout time.Duration) b
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var ok bool
-	if timeout > 0 {
-		now := time.Now().Add(timeout)
-		_, ok = c.m[k]
-		if !ok {
-			if len(c.m) == int(c.size) {
-				c.evict(1)
-			}
-
-			c.m[k] = valueWithTimeout[V]{
-				value:    v,
-				expireAt: &now,
-			}
+	if val, ok := c.m[k]; ok {
+		// Check if existing key is expired
+		if val.expireAt == 0 || val.expireAt >= time.Now().UnixNano() {
+			return false
 		}
-	} else {
-		_, ok = c.m[k]
-		if !ok {
-			if len(c.m) == int(c.size) {
-				c.evict(1)
-			}
-
-			c.m[k] = valueWithTimeout[V]{
-				value:    v,
-				expireAt: nil,
-			}
-		}
+		// Key exists but is expired, delete it
+		delete(c.m, k)
 	}
-	return !ok
+
+	var expireAt int64
+	if timeout > 0 {
+		expireAt = time.Now().Add(timeout).UnixNano()
+	}
+
+	if uint(len(c.m)) >= c.size {
+		c.evict(1)
+	}
+
+	c.m[k] = valueWithTimeout[V]{
+		value:    v,
+		expireAt: expireAt,
+	}
+	return true
 }
 
+// Get retrieves the value associated with the given key from the cache.
+// If the key is not found or has expired, it returns (zero value of V, false).
+// Otherwise, it returns (value, true).
 func (c *MCache[K, V]) Get(k K) (v V, b bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	val, ok := c.m[k]
 	if !ok {
 		return
 	}
-	if val.expireAt != nil && val.expireAt.Before(time.Now()) {
+	if val.expireAt > 0 && val.expireAt < time.Now().UnixNano() {
 		delete(c.m, k)
 		return
 	}
-	return val.value, ok
+	return val.value, true
 }
 
+// GetAll retrieves all key-value pairs from the cache.
+// It returns a map containing all the key-value pairs that are not expired.
 func (c *MCache[K, V]) GetAll() map[K]V {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	m := make(map[K]V)
+	now := time.Now().UnixNano()
 	for k, v := range c.m {
-		if v.expireAt == nil || !v.expireAt.Before(time.Now()) {
+		if v.expireAt == 0 || v.expireAt >= now {
 			m[k] = v.value
 		}
 	}
 	return m
 }
 
+// Delete removes the key-value pair associated with the given key from the cache.
 func (c *MCache[K, V]) Delete(k K) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.m, k)
 }
 
-// TransferTo transfers all key-value pairs from the source cache to the provided destination cache.
-//
-// The source cache and the destination cache are locked during the entire operation.
-// The function is safe to call concurrently with other operations on any of the source cache or destination cache.
+// TransferTo transfers all non-expired key-value pairs from the source cache to the destination cache.
+// The operation is performed in a deadlock-safe manner by not holding both locks simultaneously.
 func (src *MCache[K, V]) TransferTo(dst *MCache[K, V]) {
-	all := src.GetAll()
+	// Collect data with source lock
 	src.mu.Lock()
-	src.m = make(map[K]valueWithTimeout[V])
+	now := time.Now().UnixNano()
+	toTransfer := make(map[K]V)
+	var keysToDelete []K
+
+	for k, v := range src.m {
+		if v.expireAt == 0 || v.expireAt >= now {
+			toTransfer[k] = v.value
+			keysToDelete = append(keysToDelete, k)
+		}
+	}
+
+	// Delete transferred items from source
+	for _, k := range keysToDelete {
+		delete(src.m, k)
+	}
 	src.mu.Unlock()
 
-	for k, v := range all {
+	// Insert into destination with destination lock
+	for k, v := range toTransfer {
 		dst.Set(k, v)
 	}
 }
 
-// CopyTo copies all key-value pairs from the source cache to the provided destination cache.
-//
-// The source cache are the destination cache are locked during the entire operation.
-// The function is safe to call concurrently with other operations on any of the source cache or Destination cache.
+// CopyTo copies all non-expired key-value pairs from the source cache to the destination cache.
+// The operation is performed in a deadlock-safe manner by not holding both locks simultaneously.
 func (src *MCache[K, V]) CopyTo(dst *MCache[K, V]) {
-	all := src.GetAll()
+	// Collect data with source lock
+	src.mu.Lock()
+	now := time.Now().UnixNano()
+	toCopy := make(map[K]V)
 
-	for k, v := range all {
+	for k, v := range src.m {
+		if v.expireAt == 0 || v.expireAt >= now {
+			toCopy[k] = v.value
+		}
+	}
+	src.mu.Unlock()
+
+	// Insert into destination with destination lock
+	for k, v := range toCopy {
 		dst.Set(k, v)
 	}
 }
 
+// Keys returns a slice of all keys currently stored in the cache.
+// The returned slice does not include expired keys.
+// The order of keys in the slice is not guaranteed.
 func (c *MCache[K, V]) Keys() []K {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	keys := make([]K, 0, c.Count())
+	now := time.Now().UnixNano()
+	keys := make([]K, 0, len(c.m))
 
 	for k, v := range c.m {
-		if v.expireAt == nil || !v.expireAt.Before(time.Now()) {
+		if v.expireAt == 0 || v.expireAt >= now {
 			keys = append(keys, k)
 		}
 	}
@@ -218,7 +278,7 @@ func (c *MCache[K, V]) Keys() []K {
 }
 
 // expireKeys is a background goroutine that periodically checks for expired keys and removes them from the database.
-// It runs until the Close method is callec.
+// It runs until the Close method is called.
 // This function is not intended to be called directly by users.
 func (c *MCache[K, V]) expireKeys() {
 	ticker := time.NewTicker(c.timeInterval)
@@ -226,35 +286,50 @@ func (c *MCache[K, V]) expireKeys() {
 	for {
 		select {
 		case <-ticker.C:
+			c.mu.Lock()
+			now := time.Now().UnixNano()
 			for k, v := range c.m {
-				if v.expireAt != nil && v.expireAt.Before(time.Now()) {
-					c.mu.Lock()
+				if v.expireAt > 0 && v.expireAt < now {
 					delete(c.m, k)
-					c.mu.Unlock()
 				}
 			}
+			c.mu.Unlock()
 		case <-c.stopCh:
 			return
 		}
 	}
 }
 
+// Purge removes all key-value pairs from the cache.
+// The cache can still be used after calling Purge.
 func (c *MCache[K, V]) Purge() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.m = make(map[K]valueWithTimeout[V])
+}
+
+// Close stops the background expiration goroutine and clears the cache.
+// After calling Close, the cache should not be used.
+func (c *MCache[K, V]) Close() {
 	if c.timeInterval > 0 {
 		c.stopCh <- struct{}{} // Signal the expiration goroutine to stop
 		close(c.stopCh)
 	}
+	c.mu.Lock()
 	c.m = nil
+	c.mu.Unlock()
 }
 
-// Count returns the number of key-value pairs in the database.
+// Count returns the number of non-expired key-value pairs in the database.
 func (c *MCache[K, V]) Count() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	var count int
+	count := 0
+	now := time.Now().UnixNano()
 	for _, v := range c.m {
-		if v.expireAt == nil || !v.expireAt.Before(time.Now()) {
+		if v.expireAt == 0 || v.expireAt >= now {
 			count++
 		}
 	}
@@ -262,31 +337,43 @@ func (c *MCache[K, V]) Count() int {
 	return count
 }
 
+// Len returns the total number of elements in the cache (including expired ones).
 func (c *MCache[K, V]) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	return len(c.m)
 }
 
+// evict removes i items from the cache.
+// It first tries to evict expired items, then evicts any items if needed.
 func (c *MCache[K, V]) evict(i int) {
-	var counter int
+	now := time.Now().UnixNano()
+	counter := 0
+
+	// First pass: evict expired items
 	for k, v := range c.m {
-		if counter == i {
-			break
+		if counter >= i {
+			return
 		}
-		if v.expireAt != nil && !v.expireAt.After(time.Now()) {
+		if v.expireAt > 0 && v.expireAt < now {
 			delete(c.m, k)
 			counter++
 		}
 	}
-	if i > len(c.m) {
-		i = len(c.m)
-	}
-	for ; counter < i; counter++ {
+
+	// Second pass: evict any items if we still need to evict more
+	if counter < i {
+		remaining := i - counter
+		if remaining > len(c.m) {
+			remaining = len(c.m)
+		}
 		for k := range c.m {
+			if remaining <= 0 {
+				break
+			}
 			delete(c.m, k)
-			break
+			remaining--
 		}
 	}
 }
