@@ -9,17 +9,19 @@ import (
 type lruItem[K comparable, V any] struct {
 	key      K
 	value    V
-	expireAt *time.Time
+	expireAt int64 // Unix nano timestamp, 0 means no expiration
 }
 
-// Least Recently Used Cache
+// LRUCache implements a Least Recently Used cache with O(1) operations.
 type LRUCache[K comparable, V any] struct {
-	mu           sync.RWMutex
+	mu           sync.Mutex
 	size         uint
 	m            map[K]*list.Element // where the key-value pairs are stored
 	evictionList *list.List
 }
 
+// NewLRU creates a new LRU cache with the specified maximum size.
+// If size is 0, the cache will not store any items.
 func NewLRU[K comparable, V any](size uint) *LRUCache[K, V] {
 	return &LRUCache[K, V]{
 		size:         size,
@@ -41,7 +43,7 @@ func (c *LRUCache[K, V]) Get(k K) (v V, b bool) {
 	}
 
 	lruItem := item.Value.(*lruItem[K, V])
-	if lruItem.expireAt != nil && lruItem.expireAt.Before(time.Now()) {
+	if lruItem.expireAt > 0 && lruItem.expireAt < time.Now().UnixNano() {
 		delete(c.m, k)
 		c.evictionList.Remove(item)
 		return
@@ -55,13 +57,14 @@ func (c *LRUCache[K, V]) Get(k K) (v V, b bool) {
 // GetAll retrieves all key-value pairs from the cache.
 // It returns a map containing all the key-value pairs that are not expired.
 func (c *LRUCache[K, V]) GetAll() map[K]V {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	m := make(map[K]V)
+	now := time.Now().UnixNano()
 	for k, v := range c.m {
 		lruItem := v.Value.(*lruItem[K, V])
-		if lruItem.expireAt == nil || !lruItem.expireAt.Before(time.Now()) {
+		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
 			m[k] = lruItem.value
 		}
 	}
@@ -85,31 +88,43 @@ func (c *LRUCache[K, V]) SetWithTimeout(k K, v V, t time.Duration) {
 	c.set(k, v, t)
 }
 
-// NotFoundSet adds the key-value pair to the cache only if the key does not exist.
+// NotFoundSet adds the key-value pair to the cache only if the key does not exist or is expired.
 // It returns true if the key was added to the cache, otherwise false.
 func (c *LRUCache[K, V]) NotFoundSet(k K, v V) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	_, ok := c.m[k]
-	if ok {
-		return false
+	if item, ok := c.m[k]; ok {
+		lruItem := item.Value.(*lruItem[K, V])
+		// Check if existing key is expired
+		if lruItem.expireAt == 0 || lruItem.expireAt >= time.Now().UnixNano() {
+			return false
+		}
+		// Key exists but is expired, delete it first
+		delete(c.m, k)
+		c.evictionList.Remove(item)
 	}
 
 	c.set(k, v, 0)
 	return true
 }
 
-// NotFoundSetWithTimeout adds the key-value pair to the cache only if the key does not exist.
+// NotFoundSetWithTimeout adds the key-value pair to the cache only if the key does not exist or is expired.
 // It sets an expiration time for the key-value pair.
 // It returns true if the key was added to the cache, otherwise false.
 func (c *LRUCache[K, V]) NotFoundSetWithTimeout(k K, v V, t time.Duration) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	_, ok := c.m[k]
-	if ok {
-		return false
+	if item, ok := c.m[k]; ok {
+		lruItem := item.Value.(*lruItem[K, V])
+		// Check if existing key is expired
+		if lruItem.expireAt == 0 || lruItem.expireAt >= time.Now().UnixNano() {
+			return false
+		}
+		// Key exists but is expired, delete it first
+		delete(c.m, k)
+		c.evictionList.Remove(item)
 	}
 
 	c.set(k, v, t)
@@ -135,42 +150,73 @@ func (c *LRUCache[K, V]) delete(k K) {
 }
 
 // TransferTo transfers all non-expired key-value pairs from the source cache to the destination cache.
+// The operation is performed in a deadlock-safe manner by not holding both locks simultaneously.
 func (src *LRUCache[K, V]) TransferTo(dst *LRUCache[K, V]) {
+	// Collect data with source lock
 	src.mu.Lock()
-	defer src.mu.Unlock()
+	now := time.Now().UnixNano()
+	toTransfer := make(map[K]V)
+	var keysToDelete []K
 
 	for k, v := range src.m {
 		lruItem := v.Value.(*lruItem[K, V])
-		if lruItem.expireAt == nil || !lruItem.expireAt.Before(time.Now()) {
-			src.delete(k)
-			dst.Set(k, lruItem.value)
+		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
+			toTransfer[k] = lruItem.value
+			keysToDelete = append(keysToDelete, k)
 		}
 	}
+
+	// Delete transferred items from source
+	for _, k := range keysToDelete {
+		src.delete(k)
+	}
+	src.mu.Unlock()
+
+	// Insert into destination with destination lock
+	dst.mu.Lock()
+	for k, v := range toTransfer {
+		dst.set(k, v, 0)
+	}
+	dst.mu.Unlock()
 }
 
 // CopyTo copies all non-expired key-value pairs from the source cache to the destination cache.
+// The operation is performed in a deadlock-safe manner by not holding both locks simultaneously.
 func (src *LRUCache[K, V]) CopyTo(dst *LRUCache[K, V]) {
+	// Collect data with source lock
 	src.mu.Lock()
-	defer src.mu.Unlock()
+	now := time.Now().UnixNano()
+	toCopy := make(map[K]V)
 
 	for k, v := range src.m {
-		if lruItem := v.Value.(*lruItem[K, V]); lruItem.expireAt == nil || !lruItem.expireAt.Before(time.Now()) {
-			dst.Set(k, lruItem.value)
+		lruItem := v.Value.(*lruItem[K, V])
+		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
+			toCopy[k] = lruItem.value
 		}
 	}
+	src.mu.Unlock()
+
+	// Insert into destination with destination lock
+	dst.mu.Lock()
+	for k, v := range toCopy {
+		dst.set(k, v, 0)
+	}
+	dst.mu.Unlock()
 }
 
 // Keys returns a slice of all keys currently stored in the cache.
 // The returned slice does not include expired keys.
 // The order of keys in the slice is not guaranteed.
 func (c *LRUCache[K, V]) Keys() []K {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	keys := make([]K, 0, c.Count())
+	now := time.Now().UnixNano()
+	keys := make([]K, 0, len(c.m))
 
 	for k, v := range c.m {
-		if lruItem := v.Value.(*lruItem[K, V]); lruItem.expireAt == nil || !lruItem.expireAt.Before(time.Now()) {
+		lruItem := v.Value.(*lruItem[K, V])
+		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
 			keys = append(keys, k)
 		}
 	}
@@ -189,12 +235,14 @@ func (c *LRUCache[K, V]) Purge() {
 
 // Count returns the number of non-expired key-value pairs currently stored in the cache.
 func (c *LRUCache[K, V]) Count() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	var count int
+	count := 0
+	now := time.Now().UnixNano()
 	for _, v := range c.m {
-		if lruItem := v.Value.(*lruItem[K, V]); lruItem.expireAt == nil || !lruItem.expireAt.Before(time.Now()) {
+		lruItem := v.Value.(*lruItem[K, V])
+		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
 			count++
 		}
 	}
@@ -202,35 +250,39 @@ func (c *LRUCache[K, V]) Count() int {
 	return count
 }
 
-// Len returns the number of elements in the cache.
+// Len returns the total number of elements in the cache (including expired ones).
 func (c *LRUCache[K, V]) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	return len(c.m)
 }
 
 func (c *LRUCache[K, V]) set(k K, v V, exp time.Duration) {
-	item, ok := c.m[k]
-	var tm *time.Time
-	if exp > 0 {
-		t := time.Now().Add(exp)
-		tm = &t
+	if c.size == 0 {
+		return
 	}
+
+	var expireAt int64
+	if exp > 0 {
+		expireAt = time.Now().Add(exp).UnixNano()
+	}
+
+	item, ok := c.m[k]
 	if ok {
 		lruItem := item.Value.(*lruItem[K, V])
 		lruItem.value = v
-		lruItem.expireAt = tm
+		lruItem.expireAt = expireAt
 		c.evictionList.MoveToFront(item)
 	} else {
-		if len(c.m) == int(c.size) {
+		if uint(len(c.m)) >= c.size {
 			c.evict(1)
 		}
 
 		lruItem := &lruItem[K, V]{
 			key:      k,
 			value:    v,
-			expireAt: tm,
+			expireAt: expireAt,
 		}
 
 		insertedItem := c.evictionList.PushFront(lruItem)
