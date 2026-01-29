@@ -14,7 +14,7 @@ A high-performance, thread-safe in-memory cache library for Go. Designed to be e
 ### Installation
 
 ```bash
-go get github.com/knbr13/incache
+go get github.com/hrtsegv/incache
 ```
 
 ### Cache Types
@@ -34,7 +34,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/knbr13/incache"
+	"github.com/hrtsegv/incache"
 )
 
 func main() {
@@ -78,7 +78,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/knbr13/incache"
+	"github.com/hrtsegv/incache"
 )
 
 func main() {
@@ -113,7 +113,7 @@ package main
 import (
 	"time"
 
-	"github.com/knbr13/incache"
+	"github.com/hrtsegv/incache"
 )
 
 func main() {
@@ -135,7 +135,7 @@ All cache types implement the `Cache` interface, allowing you to write polymorph
 package main
 
 import (
-	"github.com/knbr13/incache"
+	"github.com/hrtsegv/incache"
 )
 
 func processWithCache(cache incache.Cache[string, int]) {
