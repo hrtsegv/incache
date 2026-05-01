@@ -364,10 +364,7 @@ func (c *MCache[K, V]) evict(i int) {
 
 	// Second pass: evict any items if we still need to evict more
 	if counter < i {
-		remaining := i - counter
-		if remaining > len(c.m) {
-			remaining = len(c.m)
-		}
+		remaining := min(i-counter, len(c.m))
 		for k := range c.m {
 			if remaining <= 0 {
 				break
