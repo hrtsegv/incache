@@ -24,6 +24,7 @@ type MCache[K comparable, V any] struct {
 	stopCh       chan struct{} // Channel to signal timeout goroutine to stop
 	timeInterval time.Duration // Time interval to sleep the goroutine that checks for expired keys
 	closed       atomic.Bool   // set once Close has run, guards against use-after-close panics
+	flight       flightGroup[K, V]
 }
 
 // mcacheShard is one partition of a sharded MCache. It holds the same
@@ -194,6 +195,53 @@ func (s *mcacheShard[K, V]) get(k K) (v V, b bool) {
 		return
 	}
 	return val.value, true
+}
+
+// GetOrSet returns the existing value for k if present and not expired.
+// Otherwise it calls fn to compute a value, stores the result with Set, and
+// returns it. Concurrent GetOrSet calls for the same missing key are
+// coalesced so fn runs at most once at a time per key; an error from fn is
+// returned to every waiter and nothing is cached.
+func (c *MCache[K, V]) GetOrSet(k K, fn func() (V, error)) (V, error) {
+	if v, ok := c.Get(k); ok {
+		return v, nil
+	}
+
+	return c.flight.do(k, func() (V, error) {
+		if v, ok := c.Get(k); ok {
+			return v, nil
+		}
+
+		v, err := fn()
+		if err != nil {
+			return v, err
+		}
+
+		c.Set(k, v)
+		return v, nil
+	})
+}
+
+// GetOrSetWithTimeout is GetOrSet, but stores a successful result with
+// SetWithTimeout instead of Set.
+func (c *MCache[K, V]) GetOrSetWithTimeout(k K, fn func() (V, error), timeout time.Duration) (V, error) {
+	if v, ok := c.Get(k); ok {
+		return v, nil
+	}
+
+	return c.flight.do(k, func() (V, error) {
+		if v, ok := c.Get(k); ok {
+			return v, nil
+		}
+
+		v, err := fn()
+		if err != nil {
+			return v, err
+		}
+
+		c.SetWithTimeout(k, v, timeout)
+		return v, nil
+	})
 }
 
 // GetAll retrieves all key-value pairs from the cache.

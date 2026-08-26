@@ -28,6 +28,18 @@ type Cache[K comparable, V any] interface {
 	// It returns true if the key was added to the cache, otherwise false.
 	NotFoundSetWithTimeout(k K, v V, timeout time.Duration) bool
 
+	// GetOrSet returns the existing value for k if present and not expired.
+	// Otherwise it calls fn to compute a value, stores the result without
+	// an expiration time, and returns it. Concurrent GetOrSet calls for the
+	// same missing key are coalesced so fn runs at most once at a time per
+	// key; an error from fn is returned to every waiter and nothing is
+	// cached.
+	GetOrSet(k K, fn func() (V, error)) (V, error)
+
+	// GetOrSetWithTimeout is GetOrSet, but stores a successful result with
+	// an expiration time.
+	GetOrSetWithTimeout(k K, fn func() (V, error), timeout time.Duration) (V, error)
+
 	// GetAll retrieves all non-expired key-value pairs from the cache.
 	GetAll() map[K]V
 
