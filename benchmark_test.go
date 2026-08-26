@@ -274,3 +274,91 @@ func BenchmarkMCache_Parallel_Get(b *testing.B) {
 		}
 	})
 }
+
+// Large parallel benchmarks - big enough (see shardingThreshold) to
+// exercise the sharded path with many shards under real cross-goroutine
+// contention, rather than the single-shard path the 10000-sized benchmarks
+// above mostly stay within on a typical multi-core machine's shard count.
+
+const benchLargeSize = 1_000_000
+
+func BenchmarkLFU_Parallel_Large_Set(b *testing.B) {
+	cache := NewLFU[int, int](benchLargeSize)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.Set(i%benchLargeSize, i)
+			i++
+		}
+	})
+}
+
+func BenchmarkLFU_Parallel_Large_Get(b *testing.B) {
+	cache := NewLFU[int, int](benchLargeSize)
+	for i := 0; i < benchLargeSize; i++ {
+		cache.Set(i, i)
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.Get(i % benchLargeSize)
+			i++
+		}
+	})
+}
+
+func BenchmarkLRU_Parallel_Large_Set(b *testing.B) {
+	cache := NewLRU[int, int](benchLargeSize)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.Set(i%benchLargeSize, i)
+			i++
+		}
+	})
+}
+
+func BenchmarkLRU_Parallel_Large_Get(b *testing.B) {
+	cache := NewLRU[int, int](benchLargeSize)
+	for i := 0; i < benchLargeSize; i++ {
+		cache.Set(i, i)
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.Get(i % benchLargeSize)
+			i++
+		}
+	})
+}
+
+func BenchmarkMCache_Parallel_Large_Set(b *testing.B) {
+	cache := NewManual[int, int](benchLargeSize, 0)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.Set(i%benchLargeSize, i)
+			i++
+		}
+	})
+}
+
+func BenchmarkMCache_Parallel_Large_Get(b *testing.B) {
+	cache := NewManual[int, int](benchLargeSize, 0)
+	for i := 0; i < benchLargeSize; i++ {
+		cache.Set(i, i)
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			cache.Get(i % benchLargeSize)
+			i++
+		}
+	})
+}
