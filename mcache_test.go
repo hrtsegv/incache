@@ -1,6 +1,7 @@
 package incache
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -252,6 +253,48 @@ func TestClose(t *testing.T) {
 	default:
 		t.Errorf("Close: expiration goroutine did not stop as expected")
 	}
+}
+
+func TestCloseIdempotent(t *testing.T) {
+	c := NewManual[string, string](10, time.Millisecond*50)
+	c.Set("key1", "value1")
+
+	c.Close()
+	c.Close() // must not panic (send on closed channel)
+}
+
+func TestUseAfterClose(t *testing.T) {
+	c := NewManual[string, string](10, 0)
+	c.Set("key1", "value1")
+	c.Close()
+
+	// None of these should panic (assignment to nil map) after Close.
+	c.Set("key2", "value2")
+	c.SetWithTimeout("key3", "value3", time.Second)
+	if ok := c.NotFoundSet("key4", "value4"); ok {
+		t.Errorf("NotFoundSet: expected false after Close")
+	}
+	if ok := c.NotFoundSetWithTimeout("key5", "value5", time.Second); ok {
+		t.Errorf("NotFoundSetWithTimeout: expected false after Close")
+	}
+	if v, ok := c.Get("key1"); ok {
+		t.Errorf("Get: expected nothing after Close, got %v", v)
+	}
+	c.Delete("key1")
+	c.Purge()
+}
+
+func TestSizeZeroNoBackgroundGoroutine(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	c := NewManual[string, string](0, time.Millisecond*10)
+	time.Sleep(time.Millisecond * 30)
+
+	if after := runtime.NumGoroutine(); after > before {
+		t.Errorf("expected no background goroutine for a size-0 cache: before=%d after=%d", before, after)
+	}
+
+	c.Close() // must not panic/block even though no goroutine was ever started
 }
 
 func TestCount(t *testing.T) {

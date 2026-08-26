@@ -2,6 +2,7 @@ package incache
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,6 +15,7 @@ type MCache[K comparable, V any] struct {
 	m            map[K]valueWithTimeout[V] // where the key-value pairs are stored
 	stopCh       chan struct{}             // Channel to signal timeout goroutine to stop
 	timeInterval time.Duration             // Time interval to sleep the goroutine that checks for expired keys
+	closed       atomic.Bool               // set once Close has run, guards against use-after-close panics
 }
 
 type valueWithTimeout[V any] struct {
@@ -31,7 +33,7 @@ func NewManual[K comparable, V any](size uint, timeInterval time.Duration) *MCac
 		size:         size,
 		timeInterval: timeInterval,
 	}
-	if c.timeInterval > 0 {
+	if c.size > 0 && c.timeInterval > 0 {
 		go c.expireKeys()
 	}
 	return c
@@ -41,7 +43,7 @@ func NewManual[K comparable, V any](size uint, timeInterval time.Duration) *MCac
 // If the key already exists, its value will be overwritten with the new value.
 // This function is safe for concurrent use.
 func (c *MCache[K, V]) Set(k K, v V) {
-	if c.size == 0 {
+	if c.size == 0 || c.closed.Load() {
 		return
 	}
 
@@ -70,7 +72,7 @@ func (c *MCache[K, V]) Set(k K, v V) {
 // NotFoundSet adds a key-value pair to the database if the key does not already exist or is expired, and returns true.
 // Otherwise, it does nothing and returns false.
 func (c *MCache[K, V]) NotFoundSet(k K, v V) bool {
-	if c.size == 0 {
+	if c.size == 0 || c.closed.Load() {
 		return false
 	}
 
@@ -101,7 +103,7 @@ func (c *MCache[K, V]) NotFoundSet(k K, v V) bool {
 // If the timeout duration is zero or negative, the key-value pair will not have an expiration time.
 // This function is safe for concurrent use.
 func (c *MCache[K, V]) SetWithTimeout(k K, v V, timeout time.Duration) {
-	if c.size == 0 {
+	if c.size == 0 || c.closed.Load() {
 		return
 	}
 
@@ -136,7 +138,7 @@ func (c *MCache[K, V]) SetWithTimeout(k K, v V, timeout time.Duration) {
 // Otherwise, it does nothing and returns false.
 // If the timeout is zero or negative, the key-value pair will not have an expiration time.
 func (c *MCache[K, V]) NotFoundSetWithTimeout(k K, v V, timeout time.Duration) bool {
-	if c.size == 0 {
+	if c.size == 0 || c.closed.Load() {
 		return false
 	}
 
@@ -303,6 +305,10 @@ func (c *MCache[K, V]) expireKeys() {
 // Purge removes all key-value pairs from the cache.
 // The cache can still be used after calling Purge.
 func (c *MCache[K, V]) Purge() {
+	if c.closed.Load() {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -310,12 +316,17 @@ func (c *MCache[K, V]) Purge() {
 }
 
 // Close stops the background expiration goroutine and clears the cache.
-// After calling Close, the cache should not be used.
+// After calling Close, the cache should not be used; further calls are
+// safe no-ops. Close itself is idempotent and safe to call more than once.
 func (c *MCache[K, V]) Close() {
-	if c.timeInterval > 0 {
-		c.stopCh <- struct{}{} // Signal the expiration goroutine to stop
-		close(c.stopCh)
+	if !c.closed.CompareAndSwap(false, true) {
+		return
 	}
+
+	// Closing (rather than sending on) stopCh both signals the expiration
+	// goroutine, if one is running, and is a safe no-op if it isn't.
+	close(c.stopCh)
+
 	c.mu.Lock()
 	c.m = nil
 	c.mu.Unlock()
