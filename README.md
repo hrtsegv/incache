@@ -6,8 +6,10 @@ A high-performance, thread-safe in-memory cache library for Go. Designed to be e
 
 - **Multiple eviction policies**: LRU (Least Recently Used), LFU (Least Frequently Used), and Manual (no automatic eviction policy)
 - **O(1) operations**: Both LRU and LFU implementations provide constant-time Get, Set, and Delete operations
+- **Sharded for scale**: Larger caches are internally split into shards, each with its own lock, to reduce contention under concurrent access
 - **Thread-safe**: All cache types are safe for concurrent use
 - **TTL support**: Optional expiration time for cache entries
+- **Cache-stampede protection**: `GetOrSet`/`GetOrSetWithTimeout` coalesce concurrent misses on the same key into a single compute call
 - **Generic types**: Full support for Go generics
 - **Zero dependencies**: Only uses Go standard library
 
@@ -16,6 +18,8 @@ A high-performance, thread-safe in-memory cache library for Go. Designed to be e
 ```bash
 go get github.com/hrtsegv/incache
 ```
+
+Requires Go 1.25 or later (the module pins `go 1.25.5`) - sharding uses `hash/maphash.Comparable`, added to the standard library in Go 1.24.
 
 ### Cache Types
 
@@ -127,6 +131,39 @@ func main() {
 }
 ```
 
+### Cache Stampede Protection
+
+`GetOrSet` and `GetOrSetWithTimeout` return the cached value if present, or compute and store it otherwise. Concurrent callers that miss on the same key are coalesced onto a single call to the compute function, so a hot key expiring doesn't trigger a stampede of duplicate (often expensive) work like a database query or an upstream API call:
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/hrtsegv/incache"
+)
+
+func main() {
+	cache := incache.NewLRU[string, string](1000)
+
+	loadUser := func() (string, error) {
+		// An expensive lookup - a DB query, an API call, etc. Only one
+		// goroutine will run this per missing key, even under a burst of
+		// concurrent requests for the same key.
+		return "user data", nil
+	}
+
+	value, err := cache.GetOrSetWithTimeout("user:42", loadUser, time.Minute)
+	if err != nil {
+		// The error is returned to every waiting caller; nothing is cached.
+		panic(err)
+	}
+	fmt.Println(value)
+}
+```
+
 ### Using the Cache Interface
 
 All cache types implement the `Cache` interface, allowing you to write polymorphic code:
@@ -167,6 +204,8 @@ All cache types provide the following methods:
 | `Delete(key)` | Removes a key-value pair |
 | `NotFoundSet(key, value)` | Sets only if key doesn't exist or is expired |
 | `NotFoundSetWithTimeout(key, value, duration)` | Same as above with expiration |
+| `GetOrSet(key, fn)` | Returns the cached value, or calls `fn`, stores, and returns its result; concurrent misses on the same key are coalesced into one `fn` call |
+| `GetOrSetWithTimeout(key, fn, duration)` | Same as above, stored with an expiration time |
 | `GetAll()` | Returns all non-expired key-value pairs |
 | `Keys()` | Returns all non-expired keys |
 | `Purge()` | Removes all entries (cache remains usable) |
@@ -184,9 +223,28 @@ Additional methods for `MCache`:
 - **LFU Cache**: O(1) for Get, Set, Delete operations using frequency buckets
 - **MCache**: O(1) for Get, Set, Delete; O(n) for eviction when cache is full
 
+#### Sharding
+
+Caches at or above a size threshold (1024 entries) are internally split into shards - each with its own lock and eviction state - selected by hashing the key with `hash/maphash.Comparable`. This is transparent: construction, method signatures and return values are unchanged. Smaller caches keep exactly one shard, which is identical to the single-lock behavior below the threshold: one lock, one eviction list, strictly global LRU/LFU order.
+
+For larger caches, this trades strictly-global eviction order for one lock per shard: `GetAll`, `Keys`, `Count` and `Purge` lock one shard at a time rather than the whole cache, and eviction becomes per-shard (approximating, but not guaranteeing, a single global order).
+
+Measured on an 11th Gen i7-11850H (`GOMAXPROCS=16`), parallel `Get`/`Set` against a 1,000,000-entry cache (`go test -bench Parallel_Large`, see [benchmark_test.go](benchmark_test.go)):
+
+| Operation | Single lock | Sharded | Speedup |
+|-----------|------------:|--------:|--------:|
+| LRU Set   | 170.6 ns/op | 42.8 ns/op | 4.0x |
+| LRU Get   | 173.5 ns/op | 35.5 ns/op | 4.9x |
+| LFU Set   | 223.4 ns/op | 57.9 ns/op | 3.9x |
+| LFU Get   | 251.1 ns/op | 56.5 ns/op | 4.4x |
+| MCache Set| 148.9 ns/op | 109.6 ns/op | 1.4x |
+| MCache Get| 103.9 ns/op | 23.0 ns/op | 4.5x |
+
+Actual gains depend on your workload's key distribution, `GOMAXPROCS`, and how contended the cache actually is - run `make bench` (or `go test -bench=. -benchmem ./...`) on your own hardware for numbers that matter to your use case.
+
 ### Thread Safety
 
-All cache implementations use `sync.Mutex` for thread safety. The `TransferTo` and `CopyTo` operations are designed to be deadlock-safe by not holding multiple locks simultaneously.
+All cache implementations use `sync.Mutex` (per-shard, see Sharding above) for thread safety. The `TransferTo` and `CopyTo` operations are designed to be deadlock-safe by not holding multiple locks simultaneously, including when source and destination have different shard counts.
 
 ### Contributing
 
