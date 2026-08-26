@@ -196,10 +196,15 @@ func TestKeys(t *testing.T) {
 
 	c.Set("key1", "value1")
 	c.Set("key2", "value2")
-	c.SetWithTimeout("key3", "value3", 1)
-	c.SetWithTimeout("key4", "value4", 1)
-	c.SetWithTimeout("key5", "value5", 1)
+	c.SetWithTimeout("key3", "value3", time.Nanosecond)
+	c.SetWithTimeout("key4", "value4", time.Nanosecond)
+	c.SetWithTimeout("key5", "value5", time.Nanosecond)
 	c.Set("key6", "value6")
+
+	// A 1ns TTL isn't guaranteed to have elapsed by the next instruction on
+	// platforms with coarse clock resolution (e.g. Windows, ~600us here) -
+	// sleep past it so the expiry check below is deterministic.
+	time.Sleep(time.Millisecond)
 
 	keys := c.Keys()
 

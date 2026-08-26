@@ -166,11 +166,16 @@ func TestKeys_LRU(t *testing.T) {
 	c.Set("key3", "value3")
 	c.Set("key4", "value4")
 	c.Set("key5", "value5")
-	c.SetWithTimeout("key6", "value6", 1)
-	c.SetWithTimeout("key7", "value7", 1)
-	c.SetWithTimeout("key8", "value8", 1)
-	c.SetWithTimeout("key9", "value9", 1)
+	c.SetWithTimeout("key6", "value6", time.Nanosecond)
+	c.SetWithTimeout("key7", "value7", time.Nanosecond)
+	c.SetWithTimeout("key8", "value8", time.Nanosecond)
+	c.SetWithTimeout("key9", "value9", time.Nanosecond)
 	c.Set("key10", "value10")
+
+	// A 1ns TTL isn't guaranteed to have elapsed by the next instruction on
+	// platforms with coarse clock resolution (e.g. Windows, ~600us here) -
+	// sleep past it so the expiry check below is deterministic.
+	time.Sleep(time.Millisecond)
 
 	keys := c.Keys()
 
