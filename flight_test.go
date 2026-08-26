@@ -109,6 +109,130 @@ func TestLRU_GetOrSet_ErrorNotCached(t *testing.T) {
 	}
 }
 
+func TestLFU_GetOrSet_ComputesOnMiss(t *testing.T) {
+	c := NewLFU[string, string](10)
+
+	v, err := c.GetOrSet("key1", func() (string, error) {
+		return "computed", nil
+	})
+	if err != nil || v != "computed" {
+		t.Fatalf("GetOrSet: got (%q, %v), want (computed, nil)", v, err)
+	}
+
+	if got, ok := c.Get("key1"); !ok || got != "computed" {
+		t.Errorf("expected GetOrSet to have stored the computed value, got (%q, %v)", got, ok)
+	}
+}
+
+func TestLFU_GetOrSet_CoalescesConcurrentMisses(t *testing.T) {
+	c := NewLFU[string, int](10)
+
+	var calls atomic.Int32
+	release := make(chan struct{})
+
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v, err := c.GetOrSet("shared-key", func() (int, error) {
+				calls.Add(1)
+				<-release
+				return 42, nil
+			})
+			if err != nil || v != 42 {
+				t.Errorf("got (%d, %v), want (42, nil)", v, err)
+			}
+		}()
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("fn called %d times, want exactly 1", got)
+	}
+}
+
+func TestLFU_GetOrSet_ErrorNotCached(t *testing.T) {
+	c := NewLFU[string, string](10)
+	wantErr := errors.New("compute failed")
+
+	if _, err := c.GetOrSet("key1", func() (string, error) {
+		return "", wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("GetOrSet: got err %v, want %v", err, wantErr)
+	}
+
+	if _, ok := c.Get("key1"); ok {
+		t.Errorf("expected nothing to be cached after an error from fn")
+	}
+}
+
+func TestMCache_GetOrSet_ComputesOnMiss(t *testing.T) {
+	c := NewManual[string, string](10, 0)
+
+	v, err := c.GetOrSet("key1", func() (string, error) {
+		return "computed", nil
+	})
+	if err != nil || v != "computed" {
+		t.Fatalf("GetOrSet: got (%q, %v), want (computed, nil)", v, err)
+	}
+
+	if got, ok := c.Get("key1"); !ok || got != "computed" {
+		t.Errorf("expected GetOrSet to have stored the computed value, got (%q, %v)", got, ok)
+	}
+}
+
+func TestMCache_GetOrSet_CoalescesConcurrentMisses(t *testing.T) {
+	c := NewManual[string, int](10, 0)
+
+	var calls atomic.Int32
+	release := make(chan struct{})
+
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v, err := c.GetOrSet("shared-key", func() (int, error) {
+				calls.Add(1)
+				<-release
+				return 42, nil
+			})
+			if err != nil || v != 42 {
+				t.Errorf("got (%d, %v), want (42, nil)", v, err)
+			}
+		}()
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("fn called %d times, want exactly 1", got)
+	}
+}
+
+func TestMCache_GetOrSet_ErrorNotCached(t *testing.T) {
+	c := NewManual[string, string](10, 0)
+	wantErr := errors.New("compute failed")
+
+	if _, err := c.GetOrSet("key1", func() (string, error) {
+		return "", wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("GetOrSet: got err %v, want %v", err, wantErr)
+	}
+
+	if _, ok := c.Get("key1"); ok {
+		t.Errorf("expected nothing to be cached after an error from fn")
+	}
+}
+
 func TestLRU_GetOrSetWithTimeout_ExpiredKeyRecomputes(t *testing.T) {
 	c := NewLRU[string, int](10)
 
