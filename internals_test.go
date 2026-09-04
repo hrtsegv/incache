@@ -91,3 +91,45 @@ func TestMCache_WritesDuringCloseAreNoOps(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// TestMCache_EvictionPrefersExpired checks that a full shard sheds expired
+// entries ahead of live ones. Eviction samples a bounded number of entries
+// rather than scanning the whole shard, so this is probabilistic: it evicts
+// a live entry only when every entry in the sample is live. The insert
+// count is kept well below the number of expired entries so the expired
+// pool cannot drain and turn later evictions into coin flips.
+func TestMCache_EvictionPrefersExpired(t *testing.T) {
+	const size = 100
+	const live = 10
+	const inserts = 25
+
+	c := NewManual[int, int](size, 0)
+
+	for i := 0; i < live; i++ {
+		c.Set(i, i) // no expiry
+	}
+	for i := live; i < size; i++ {
+		c.SetWithTimeout(i, i, 5*time.Millisecond)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	// The cache is full, so every one of these inserts evicts something.
+	for i := 0; i < inserts; i++ {
+		c.Set(1000+i, i)
+	}
+
+	survivors := 0
+	for i := 0; i < live; i++ {
+		if _, ok := c.Get(i); ok {
+			survivors++
+		}
+	}
+
+	// Expired entries outnumber live ones throughout the run, so losing
+	// even one live entry is unlikely; allow a single loss so the test
+	// cannot flake, but catch eviction that ignores expiry altogether.
+	if survivors < live-1 {
+		t.Errorf("%d of %d live entries survived eviction, want at least %d", survivors, live, live-1)
+	}
+}
