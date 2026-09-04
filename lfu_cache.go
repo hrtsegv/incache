@@ -1,10 +1,23 @@
 package incache
 
 import (
-	"container/list"
 	"sync"
 	"time"
 )
+
+// lfuEntry is one cached item and, at the same time, a node in the circular
+// doubly-linked list of its frequency bucket. Threading the list through the
+// entry itself, rather than storing the entry inside a container/list
+// element, means a frequency increment can relink the existing node instead
+// of allocating a fresh element for the new bucket - which is what makes an
+// LFU Get allocation-free.
+type lfuEntry[K comparable, V any] struct {
+	prev, next *lfuEntry[K, V]
+	key        K
+	value      V
+	expireAt   int64 // Unix nano timestamp, 0 means no expiration
+	freq       uint
+}
 
 // LFUCache implements a Least Frequently Used cache with O(1) operations.
 // It uses frequency buckets to efficiently track and evict items.
@@ -29,18 +42,22 @@ type LFUCache[K comparable, V any] struct {
 // sharding was introduced; LFUCache just routes each key to one of these by
 // hash.
 type lfuShard[K comparable, V any] struct {
-	mu        sync.Mutex
-	size      uint
-	minFreq   uint
-	items     map[K]*list.Element // key → list element containing lfuItem
-	freqLists map[uint]*list.List // frequency → list of items with that frequency
-}
-
-type lfuItem[K comparable, V any] struct {
-	key      K
-	value    V
-	freq     uint
-	expireAt int64 // Unix nano timestamp, 0 means no expiration
+	mu    sync.Mutex
+	size  uint
+	items map[K]*lfuEntry[K, V]
+	// freqHeads maps a frequency to the head of that frequency's circular
+	// list of entries. The list is circular, so head.prev is its tail: the
+	// least recently used entry at that frequency, which is the one
+	// eviction takes. A frequency is present in this map only while it
+	// holds at least one entry, so emptied buckets are dropped rather than
+	// accumulating for the lifetime of the cache.
+	freqHeads map[uint]*lfuEntry[K, V]
+	// minFreq is a lower bound on the smallest frequency currently in
+	// freqHeads, not necessarily an exact value: removing entries can raise
+	// the true minimum without updating it. Eviction repairs it lazily via
+	// updateMinFreq, which keeps Delete O(1) instead of making every delete
+	// that empties a bucket scan all of them.
+	minFreq uint
 }
 
 // NewLFU creates a new LFU cache with the specified maximum size.
@@ -58,8 +75,8 @@ func NewLFU[K comparable, V any](size uint) *LFUCache[K, V] {
 func newLFUShard[K comparable, V any](size uint) *lfuShard[K, V] {
 	return &lfuShard[K, V]{
 		size:      size,
-		items:     make(map[K]*list.Element),
-		freqLists: make(map[uint]*list.List),
+		items:     make(map[K]*lfuEntry[K, V]),
+		freqHeads: make(map[uint]*lfuEntry[K, V]),
 	}
 }
 
@@ -67,18 +84,90 @@ func (c *LFUCache[K, V]) shardFor(k K) *lfuShard[K, V] {
 	return c.shards[shardIndexFor(k, len(c.shards))]
 }
 
+// freqPushFront links e into the front of bucket f, creating the bucket if
+// it does not exist yet. It assumes s.mu is already held by the caller.
+func (s *lfuShard[K, V]) freqPushFront(f uint, e *lfuEntry[K, V]) {
+	head := s.freqHeads[f]
+	if head == nil {
+		e.prev, e.next = e, e
+	} else {
+		e.prev, e.next = head.prev, head
+		head.prev.next = e
+		head.prev = e
+	}
+	s.freqHeads[f] = e
+}
+
+// freqRemove unlinks e from bucket f, deleting the bucket once it is empty.
+// Dropping empty buckets is what keeps freqHeads bounded by the number of
+// live frequencies rather than by the number of accesses ever made.
+// It assumes s.mu is already held by the caller.
+func (s *lfuShard[K, V]) freqRemove(f uint, e *lfuEntry[K, V]) {
+	if e.next == e {
+		delete(s.freqHeads, f)
+	} else {
+		e.prev.next = e.next
+		e.next.prev = e.prev
+		if s.freqHeads[f] == e {
+			s.freqHeads[f] = e.next
+		}
+	}
+	e.prev, e.next = nil, nil
+}
+
+// incrementFreq moves an entry into the next frequency bucket - O(1), and
+// with no allocation, because the entry node itself is relinked.
+// It assumes s.mu is already held by the caller.
+func (s *lfuShard[K, V]) incrementFreq(e *lfuEntry[K, V]) {
+	old := e.freq
+	s.freqRemove(old, e)
+
+	// If the bucket just emptied and it was the minimum, nothing is left
+	// below old+1, which is where this entry is about to land - so old+1 is
+	// the new minimum.
+	if old == s.minFreq {
+		if _, ok := s.freqHeads[old]; !ok {
+			s.minFreq = old + 1
+		}
+	}
+
+	e.freq = old + 1
+	s.freqPushFront(e.freq, e)
+}
+
+// removeEntry drops e from both the item map and its frequency bucket.
+// It deliberately leaves minFreq alone: minFreq is only ever used as a
+// starting point for eviction, which repairs it if it has gone stale.
+// It assumes s.mu is already held by the caller.
+func (s *lfuShard[K, V]) removeEntry(e *lfuEntry[K, V]) {
+	s.freqRemove(e.freq, e)
+	delete(s.items, e.key)
+}
+
+// updateMinFreq resets minFreq to the smallest live frequency. Because
+// empty buckets are never left in freqHeads, the frequency it picks always
+// has an entry to evict.
+// It assumes s.mu is already held by the caller.
+func (s *lfuShard[K, V]) updateMinFreq() {
+	s.minFreq = 0
+	for freq := range s.freqHeads {
+		if s.minFreq == 0 || freq < s.minFreq {
+			s.minFreq = freq
+		}
+	}
+}
+
 // Set adds the key-value pair to the cache.
 func (c *LFUCache[K, V]) Set(key K, value V) {
-	s := c.shardFor(key)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.set(key, value, 0)
+	c.shardFor(key).setLocked(key, value, 0)
 }
 
 // SetWithTimeout adds the key-value pair to the cache with a specified expiration time.
 func (c *LFUCache[K, V]) SetWithTimeout(key K, value V, exp time.Duration) {
-	s := c.shardFor(key)
+	c.shardFor(key).setLocked(key, value, exp)
+}
+
+func (s *lfuShard[K, V]) setLocked(key K, value V, exp time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -97,11 +186,10 @@ func (s *lfuShard[K, V]) set(key K, value V, exp time.Duration) {
 	}
 
 	// Check if key already exists
-	if elem, ok := s.items[key]; ok {
-		item := elem.Value.(*lfuItem[K, V])
-		item.value = value
-		item.expireAt = expireAt
-		s.incrementFreq(elem)
+	if e, ok := s.items[key]; ok {
+		e.value = value
+		e.expireAt = expireAt
+		s.incrementFreq(e)
 		return
 	}
 
@@ -110,20 +198,15 @@ func (s *lfuShard[K, V]) set(key K, value V, exp time.Duration) {
 		s.evict(1)
 	}
 
-	// Create new item with frequency 1
-	item := &lfuItem[K, V]{
+	// Create new entry with frequency 1
+	e := &lfuEntry[K, V]{
 		key:      key,
 		value:    value,
 		freq:     1,
 		expireAt: expireAt,
 	}
-
-	// Add to frequency 1 list
-	if s.freqLists[1] == nil {
-		s.freqLists[1] = list.New()
-	}
-	elem := s.freqLists[1].PushFront(item)
-	s.items[key] = elem
+	s.freqPushFront(1, e)
+	s.items[key] = e
 	s.minFreq = 1
 }
 
@@ -138,53 +221,19 @@ func (s *lfuShard[K, V]) get(key K) (v V, b bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	elem, ok := s.items[key]
+	e, ok := s.items[key]
 	if !ok {
 		return
 	}
 
-	item := elem.Value.(*lfuItem[K, V])
-
 	// Check expiration
-	if item.expireAt > 0 && item.expireAt < time.Now().UnixNano() {
-		s.delete(key, elem)
+	if e.expireAt > 0 && e.expireAt < time.Now().UnixNano() {
+		s.removeEntry(e)
 		return
 	}
 
-	s.incrementFreq(elem)
-	return item.value, true
-}
-
-// incrementFreq moves an item to the next frequency bucket - O(1) operation
-func (s *lfuShard[K, V]) incrementFreq(elem *list.Element) {
-	item := elem.Value.(*lfuItem[K, V])
-	oldFreq := item.freq
-	newFreq := oldFreq + 1
-
-	// Remove from old frequency list. An emptied list must always be
-	// dropped, not just when it emptied at the minimum frequency: a key
-	// climbing past a colder one empties a list on every access, and
-	// leaving those behind grows freqLists with the number of accesses
-	// rather than with the number of items.
-	oldList := s.freqLists[oldFreq]
-	oldList.Remove(elem)
-
-	if oldList.Len() == 0 {
-		delete(s.freqLists, oldFreq)
-		// Nothing is left at oldFreq, and this item is about to land at
-		// oldFreq+1, so that is the new minimum.
-		if oldFreq == s.minFreq {
-			s.minFreq = newFreq
-		}
-	}
-
-	// Add to new frequency list
-	item.freq = newFreq
-	if s.freqLists[newFreq] == nil {
-		s.freqLists[newFreq] = list.New()
-	}
-	newElem := s.freqLists[newFreq].PushFront(item)
-	s.items[item.key] = newElem
+	s.incrementFreq(e)
+	return e.value, true
 }
 
 // NotFoundSet adds the key-value pair to the cache only if the key does not exist or is expired.
@@ -204,14 +253,13 @@ func (s *lfuShard[K, V]) notFoundSet(k K, v V, t time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if elem, ok := s.items[k]; ok {
-		item := elem.Value.(*lfuItem[K, V])
+	if e, ok := s.items[k]; ok {
 		// Check if existing key is expired
-		if item.expireAt == 0 || item.expireAt >= time.Now().UnixNano() {
+		if e.expireAt == 0 || e.expireAt >= time.Now().UnixNano() {
 			return false
 		}
 		// Key exists but is expired, delete it first
-		s.delete(k, elem)
+		s.removeEntry(e)
 	}
 
 	s.set(k, v, t)
@@ -280,10 +328,9 @@ func (s *lfuShard[K, V]) getAllInto(m map[K]V) {
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	for k, elem := range s.items {
-		item := elem.Value.(*lfuItem[K, V])
-		if item.expireAt == 0 || item.expireAt >= now {
-			m[k] = item.value
+	for k, e := range s.items {
+		if e.expireAt == 0 || e.expireAt >= now {
+			m[k] = e.value
 		}
 	}
 }
@@ -308,13 +355,12 @@ func (s *lfuShard[K, V]) collectAndClear() map[K]V {
 
 	// Deleting from a map while ranging over it is defined behavior in Go,
 	// so the collected entries can be removed in the same pass.
-	for k, elem := range s.items {
-		item := elem.Value.(*lfuItem[K, V])
-		if item.expireAt != 0 && item.expireAt < now {
+	for k, e := range s.items {
+		if e.expireAt != 0 && e.expireAt < now {
 			continue
 		}
-		toTransfer[k] = item.value
-		s.delete(k, elem)
+		toTransfer[k] = e.value
+		s.removeEntry(e)
 	}
 
 	return toTransfer
@@ -338,10 +384,9 @@ func (s *lfuShard[K, V]) snapshot() map[K]V {
 	now := time.Now().UnixNano()
 	toCopy := make(map[K]V, len(s.items))
 
-	for k, elem := range s.items {
-		item := elem.Value.(*lfuItem[K, V])
-		if item.expireAt == 0 || item.expireAt >= now {
-			toCopy[k] = item.value
+	for k, e := range s.items {
+		if e.expireAt == 0 || e.expireAt >= now {
+			toCopy[k] = e.value
 		}
 	}
 
@@ -367,12 +412,12 @@ func (s *lfuShard[K, V]) appendKeys(dst []K) []K {
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	for k, elem := range s.items {
-		item := elem.Value.(*lfuItem[K, V])
-		if item.expireAt == 0 || item.expireAt >= now {
+	for k, e := range s.items {
+		if e.expireAt == 0 || e.expireAt >= now {
 			dst = append(dst, k)
 		}
 	}
+
 	return dst
 }
 
@@ -387,8 +432,8 @@ func (s *lfuShard[K, V]) purge() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.items = make(map[K]*list.Element)
-	s.freqLists = make(map[uint]*list.List)
+	s.items = make(map[K]*lfuEntry[K, V])
+	s.freqHeads = make(map[uint]*lfuEntry[K, V])
 	s.minFreq = 0
 }
 
@@ -407,9 +452,8 @@ func (s *lfuShard[K, V]) count() int {
 
 	count := 0
 	now := time.Now().UnixNano()
-	for _, elem := range s.items {
-		item := elem.Value.(*lfuItem[K, V])
-		if item.expireAt == 0 || item.expireAt >= now {
+	for _, e := range s.items {
+		if e.expireAt == 0 || e.expireAt >= now {
 			count++
 		}
 	}
@@ -441,69 +485,29 @@ func (s *lfuShard[K, V]) deleteKey(k K) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if elem, ok := s.items[k]; ok {
-		s.delete(k, elem)
+	if e, ok := s.items[k]; ok {
+		s.removeEntry(e)
 	}
 }
 
-// delete assumes s.mu is already held by the caller.
-//
-// It deliberately leaves minFreq alone. minFreq is only ever a starting
-// point for eviction, which repairs it if it has gone stale, so removing an
-// item does not need to pay for a scan of every bucket - it only has to
-// leave minFreq at or below the true minimum, which removing an item
-// always does.
-func (s *lfuShard[K, V]) delete(key K, elem *list.Element) {
-	item := elem.Value.(*lfuItem[K, V])
-	freq := item.freq
-
-	// Remove from frequency list
-	freqList := s.freqLists[freq]
-	if freqList != nil {
-		freqList.Remove(elem)
-		if freqList.Len() == 0 {
-			delete(s.freqLists, freq)
-		}
-	}
-
-	delete(s.items, key)
-}
-
-// updateMinFreq resets minFreq to the smallest live frequency. Because
-// emptied lists are never left in freqLists, the frequency it picks always
-// has an item to evict.
+// evict removes n entries with the lowest frequency - O(1) per entry,
+// apart from the rare updateMinFreq scan when minFreq has gone stale.
 // It assumes s.mu is already held by the caller.
-func (s *lfuShard[K, V]) updateMinFreq() {
-	s.minFreq = 0
-	for freq := range s.freqLists {
-		if s.minFreq == 0 || freq < s.minFreq {
-			s.minFreq = freq
-		}
-	}
-}
-
-// evict removes n items with the lowest frequency - O(1) per item
 func (s *lfuShard[K, V]) evict(n int) {
 	for i := 0; i < n && len(s.items) > 0; i++ {
-		// Get the list with minimum frequency. Every list in freqLists has
-		// items in it, so a hit here is always evictable; a miss just means
-		// minFreq is a lower bound that deletions have left behind.
-		minList := s.freqLists[s.minFreq]
-		if minList == nil {
+		head, ok := s.freqHeads[s.minFreq]
+		if !ok {
+			// minFreq is a lower bound that deletions have left behind;
+			// find the real minimum and try again.
 			s.updateMinFreq()
-			minList = s.freqLists[s.minFreq]
-			if minList == nil {
+			head, ok = s.freqHeads[s.minFreq]
+			if !ok {
 				return
 			}
 		}
 
-		// Remove the least recently used item from the minimum frequency list (back of list)
-		elem := minList.Back()
-		if elem == nil {
-			return
-		}
-
-		item := elem.Value.(*lfuItem[K, V])
-		s.delete(item.key, elem)
+		// The bucket is circular, so head.prev is its tail: the least
+		// recently used entry at the minimum frequency.
+		s.removeEntry(head.prev)
 	}
 }

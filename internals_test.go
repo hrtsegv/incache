@@ -31,12 +31,12 @@ func TestLFU_FrequencyBucketsDoNotLeak(t *testing.T) {
 
 	s := c.shards[0]
 	s.mu.Lock()
-	buckets := len(s.freqLists)
+	buckets := len(s.freqHeads)
 	s.mu.Unlock()
 
 	// Two live items can occupy at most two distinct frequencies.
 	if buckets > 2 {
-		t.Errorf("freqLists holds %d buckets after %d accesses to a 2-item cache, want <= 2", buckets, accesses)
+		t.Errorf("freqHeads holds %d buckets after %d accesses to a 2-item cache, want <= 2", buckets, accesses)
 	}
 }
 
@@ -57,6 +57,100 @@ func TestLFU_StaysWithinCapacity(t *testing.T) {
 		if l := c.Len(); l > size {
 			t.Fatalf("Len() = %d after %d operations, want <= %d", l, i+1, size)
 		}
+	}
+}
+
+// TestLFU_BucketsWellFormed checks that every entry is reachable from
+// exactly one frequency bucket, that each bucket is a properly terminated
+// circular list, and that entries sit in the bucket matching their own
+// frequency.
+func TestLFU_BucketsWellFormed(t *testing.T) {
+	c := NewLFU[int, int](64)
+	for i := 0; i < 5000; i++ {
+		c.Set(i%80, i)
+		c.Get(i % 30)
+		if i%11 == 0 {
+			c.Delete(i % 80)
+		}
+	}
+
+	s := c.shards[0]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	seen := make(map[int]bool)
+	for freq, head := range s.freqHeads {
+		if head == nil {
+			t.Fatalf("bucket %d is present in freqHeads but has a nil head", freq)
+		}
+		for e, n := head, 0; ; e, n = e.next, n+1 {
+			if n > len(s.items) {
+				t.Fatalf("bucket %d does not terminate: walked %d entries with only %d items in the shard", freq, n, len(s.items))
+			}
+			if e.freq != freq {
+				t.Errorf("entry %v has freq %d but sits in bucket %d", e.key, e.freq, freq)
+			}
+			if e.next.prev != e || e.prev.next != e {
+				t.Errorf("entry %v has broken prev/next links in bucket %d", e.key, freq)
+			}
+			if seen[e.key] {
+				t.Fatalf("entry %v is linked into the bucket lists more than once", e.key)
+			}
+			seen[e.key] = true
+
+			if e.next == head {
+				break
+			}
+		}
+	}
+
+	if len(seen) != len(s.items) {
+		t.Errorf("%d entries reachable from freqHeads, but items map holds %d", len(seen), len(s.items))
+	}
+}
+
+// TestLRU_RecencyListWellFormed is the equivalent check for the LRU shard's
+// circular recency list.
+func TestLRU_RecencyListWellFormed(t *testing.T) {
+	c := NewLRU[int, int](64)
+	for i := 0; i < 5000; i++ {
+		c.Set(i%80, i)
+		c.Get(i % 30)
+		if i%11 == 0 {
+			c.Delete(i % 80)
+		}
+	}
+
+	s := c.shards[0]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.m) == 0 {
+		t.Fatal("test setup: expected the shard to hold entries")
+	}
+	if s.head == nil {
+		t.Fatal("head is nil but the shard holds entries")
+	}
+
+	n := 0
+	for e := s.head; ; e = e.next {
+		n++
+		if n > len(s.m) {
+			t.Fatalf("recency list does not terminate: walked %d entries with only %d in the map", n, len(s.m))
+		}
+		if e.next.prev != e || e.prev.next != e {
+			t.Fatalf("entry %v has broken prev/next links", e.key)
+		}
+		if s.m[e.key] != e {
+			t.Fatalf("entry %v is linked into the recency list but is not the map's entry for that key", e.key)
+		}
+		if e.next == s.head {
+			break
+		}
+	}
+
+	if n != len(s.m) {
+		t.Errorf("%d entries in the recency list, but map holds %d", n, len(s.m))
 	}
 }
 

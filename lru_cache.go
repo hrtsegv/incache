@@ -1,15 +1,21 @@
 package incache
 
 import (
-	"container/list"
 	"sync"
 	"time"
 )
 
-type lruItem[K comparable, V any] struct {
-	key      K
-	value    V
-	expireAt int64 // Unix nano timestamp, 0 means no expiration
+// lruEntry is one cached item and, at the same time, a node in its shard's
+// circular doubly-linked recency list. Threading the list through the entry
+// itself, rather than storing the entry inside a container/list element,
+// halves the per-item allocation count (one node instead of an element plus
+// a separate item) and removes both the interface boxing and the type
+// assertion container/list forces on every Get.
+type lruEntry[K comparable, V any] struct {
+	prev, next *lruEntry[K, V]
+	key        K
+	value      V
+	expireAt   int64 // Unix nano timestamp, 0 means no expiration
 }
 
 // LRUCache implements a Least Recently Used cache with O(1) operations.
@@ -33,10 +39,13 @@ type LRUCache[K comparable, V any] struct {
 // eviction logic a non-sharded LRUCache used before sharding was
 // introduced; LRUCache just routes each key to one of these by hash.
 type lruShard[K comparable, V any] struct {
-	mu           sync.Mutex
-	size         uint
-	m            map[K]*list.Element // where the key-value pairs are stored
-	evictionList *list.List
+	mu   sync.Mutex
+	size uint
+	m    map[K]*lruEntry[K, V]
+	// head is the most recently used entry. The list is circular, so
+	// head.prev is the least recently used entry - the eviction candidate -
+	// and no sentinel node is needed. A nil head means the shard is empty.
+	head *lruEntry[K, V]
 }
 
 // NewLRU creates a new LRU cache with the specified maximum size.
@@ -53,14 +62,68 @@ func NewLRU[K comparable, V any](size uint) *LRUCache[K, V] {
 
 func newLRUShard[K comparable, V any](size uint) *lruShard[K, V] {
 	return &lruShard[K, V]{
-		size:         size,
-		m:            make(map[K]*list.Element),
-		evictionList: list.New(),
+		size: size,
+		m:    make(map[K]*lruEntry[K, V]),
 	}
 }
 
 func (c *LRUCache[K, V]) shardFor(k K) *lruShard[K, V] {
 	return c.shards[shardIndexFor(k, len(c.shards))]
+}
+
+// pushFront links e into the recency list as the most recently used entry.
+// It assumes s.mu is already held by the caller.
+func (s *lruShard[K, V]) pushFront(e *lruEntry[K, V]) {
+	if s.head == nil {
+		e.prev, e.next = e, e
+	} else {
+		e.prev, e.next = s.head.prev, s.head
+		s.head.prev.next = e
+		s.head.prev = e
+	}
+	s.head = e
+}
+
+// unlink removes e from the recency list.
+// It assumes s.mu is already held by the caller.
+func (s *lruShard[K, V]) unlink(e *lruEntry[K, V]) {
+	if e.next == e {
+		s.head = nil
+	} else {
+		e.prev.next = e.next
+		e.next.prev = e.prev
+		if s.head == e {
+			s.head = e.next
+		}
+	}
+	e.prev, e.next = nil, nil
+}
+
+// moveToFront marks e, which must already be in the list, as the most
+// recently used entry. This runs on every cache hit, so it relinks e in
+// place instead of going through unlink followed by pushFront.
+// It assumes s.mu is already held by the caller.
+func (s *lruShard[K, V]) moveToFront(e *lruEntry[K, V]) {
+	if s.head == e {
+		return
+	}
+	// e is in the list and is not the head, so the list holds at least two
+	// entries and every pointer touched below is non-nil.
+	e.prev.next = e.next
+	e.next.prev = e.prev
+
+	h := s.head
+	e.prev, e.next = h.prev, h
+	h.prev.next = e
+	h.prev = e
+	s.head = e
+}
+
+// removeEntry drops e from both the map and the recency list.
+// It assumes s.mu is already held by the caller.
+func (s *lruShard[K, V]) removeEntry(e *lruEntry[K, V]) {
+	delete(s.m, e.key)
+	s.unlink(e)
 }
 
 // Get retrieves the value associated with the given key from the cache.
@@ -74,21 +137,19 @@ func (s *lruShard[K, V]) get(k K) (v V, b bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	item, ok := s.m[k]
+	e, ok := s.m[k]
 	if !ok {
 		return
 	}
 
-	lruItem := item.Value.(*lruItem[K, V])
-	if lruItem.expireAt > 0 && lruItem.expireAt < time.Now().UnixNano() {
-		delete(s.m, k)
-		s.evictionList.Remove(item)
+	if e.expireAt > 0 && e.expireAt < time.Now().UnixNano() {
+		s.removeEntry(e)
 		return
 	}
 
-	s.evictionList.MoveToFront(item)
+	s.moveToFront(e)
 
-	return lruItem.value, true
+	return e.value, true
 }
 
 // GetAll retrieves all key-value pairs from the cache.
@@ -106,30 +167,28 @@ func (s *lruShard[K, V]) getAllInto(m map[K]V) {
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	for k, v := range s.m {
-		lruItem := v.Value.(*lruItem[K, V])
-		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
-			m[k] = lruItem.value
+	for k, e := range s.m {
+		if e.expireAt == 0 || e.expireAt >= now {
+			m[k] = e.value
 		}
 	}
 }
 
 // Set adds the key-value pair to the cache.
 func (c *LRUCache[K, V]) Set(k K, v V) {
-	s := c.shardFor(k)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.set(k, v, 0)
+	c.shardFor(k).setLocked(k, v, 0)
 }
 
 // SetWithTimeout adds the key-value pair to the cache with a specified expiration time.
 func (c *LRUCache[K, V]) SetWithTimeout(k K, v V, t time.Duration) {
-	s := c.shardFor(k)
+	c.shardFor(k).setLocked(k, v, t)
+}
+
+func (s *lruShard[K, V]) setLocked(k K, v V, exp time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.set(k, v, t)
+	s.set(k, v, exp)
 }
 
 // NotFoundSet adds the key-value pair to the cache only if the key does not exist or is expired.
@@ -149,15 +208,13 @@ func (s *lruShard[K, V]) notFoundSet(k K, v V, t time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if item, ok := s.m[k]; ok {
-		lruItem := item.Value.(*lruItem[K, V])
+	if e, ok := s.m[k]; ok {
 		// Check if existing key is expired
-		if lruItem.expireAt == 0 || lruItem.expireAt >= time.Now().UnixNano() {
+		if e.expireAt == 0 || e.expireAt >= time.Now().UnixNano() {
 			return false
 		}
 		// Key exists but is expired, delete it first
-		delete(s.m, k)
-		s.evictionList.Remove(item)
+		s.removeEntry(e)
 	}
 
 	s.set(k, v, t)
@@ -220,13 +277,9 @@ func (s *lruShard[K, V]) delete(k K) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	item, ok := s.m[k]
-	if !ok {
-		return
+	if e, ok := s.m[k]; ok {
+		s.removeEntry(e)
 	}
-
-	delete(s.m, k)
-	s.evictionList.Remove(item)
 }
 
 // TransferTo transfers all non-expired key-value pairs from the source cache to the destination cache.
@@ -249,14 +302,12 @@ func (s *lruShard[K, V]) collectAndClear() map[K]V {
 
 	// Deleting from a map while ranging over it is defined behavior in Go,
 	// so the collected entries can be removed in the same pass.
-	for k, v := range s.m {
-		lruItem := v.Value.(*lruItem[K, V])
-		if lruItem.expireAt != 0 && lruItem.expireAt < now {
+	for k, e := range s.m {
+		if e.expireAt != 0 && e.expireAt < now {
 			continue
 		}
-		toTransfer[k] = lruItem.value
-		delete(s.m, k)
-		s.evictionList.Remove(v)
+		toTransfer[k] = e.value
+		s.removeEntry(e)
 	}
 
 	return toTransfer
@@ -280,10 +331,9 @@ func (s *lruShard[K, V]) snapshot() map[K]V {
 	now := time.Now().UnixNano()
 	toCopy := make(map[K]V, len(s.m))
 
-	for k, v := range s.m {
-		lruItem := v.Value.(*lruItem[K, V])
-		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
-			toCopy[k] = lruItem.value
+	for k, e := range s.m {
+		if e.expireAt == 0 || e.expireAt >= now {
+			toCopy[k] = e.value
 		}
 	}
 
@@ -309,9 +359,8 @@ func (s *lruShard[K, V]) appendKeys(dst []K) []K {
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	for k, v := range s.m {
-		lruItem := v.Value.(*lruItem[K, V])
-		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
+	for k, e := range s.m {
+		if e.expireAt == 0 || e.expireAt >= now {
 			dst = append(dst, k)
 		}
 	}
@@ -330,8 +379,8 @@ func (s *lruShard[K, V]) purge() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.m = make(map[K]*list.Element)
-	s.evictionList.Init()
+	s.m = make(map[K]*lruEntry[K, V])
+	s.head = nil
 }
 
 // Count returns the number of non-expired key-value pairs currently stored in the cache.
@@ -349,9 +398,8 @@ func (s *lruShard[K, V]) count() int {
 
 	count := 0
 	now := time.Now().UnixNano()
-	for _, v := range s.m {
-		lruItem := v.Value.(*lruItem[K, V])
-		if lruItem.expireAt == 0 || lruItem.expireAt >= now {
+	for _, e := range s.m {
+		if e.expireAt == 0 || e.expireAt >= now {
 			count++
 		}
 	}
@@ -386,35 +434,35 @@ func (s *lruShard[K, V]) set(k K, v V, exp time.Duration) {
 		expireAt = time.Now().Add(exp).UnixNano()
 	}
 
-	item, ok := s.m[k]
-	if ok {
-		lruItem := item.Value.(*lruItem[K, V])
-		lruItem.value = v
-		lruItem.expireAt = expireAt
-		s.evictionList.MoveToFront(item)
-	} else {
-		if uint(len(s.m)) >= s.size {
-			s.evict(1)
-		}
-
-		lruItem := &lruItem[K, V]{
-			key:      k,
-			value:    v,
-			expireAt: expireAt,
-		}
-
-		insertedItem := s.evictionList.PushFront(lruItem)
-		s.m[k] = insertedItem
+	if e, ok := s.m[k]; ok {
+		e.value = v
+		e.expireAt = expireAt
+		s.moveToFront(e)
+		return
 	}
+
+	if uint(len(s.m)) >= s.size {
+		s.evict(1)
+	}
+
+	e := &lruEntry[K, V]{
+		key:      k,
+		value:    v,
+		expireAt: expireAt,
+	}
+	s.pushFront(e)
+	s.m[k] = e
 }
 
+// evict removes the i least recently used entries.
+// It assumes s.mu is already held by the caller.
 func (s *lruShard[K, V]) evict(i int) {
 	for j := 0; j < i; j++ {
-		if b := s.evictionList.Back(); b != nil {
-			delete(s.m, b.Value.(*lruItem[K, V]).key)
-			s.evictionList.Remove(b)
-		} else {
+		if s.head == nil {
 			return
 		}
+		// The list is circular, so head.prev is its tail: the least
+		// recently used entry.
+		s.removeEntry(s.head.prev)
 	}
 }
