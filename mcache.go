@@ -261,7 +261,7 @@ func (c *MCache[K, V]) GetOrSetWithTimeout(k K, fn func() (V, error), timeout ti
 // GetAll retrieves all key-value pairs from the cache.
 // It returns a map containing all the key-value pairs that are not expired.
 func (c *MCache[K, V]) GetAll() map[K]V {
-	m := make(map[K]V)
+	m := make(map[K]V, c.Len())
 	for _, s := range c.shards {
 		s.getAllInto(m)
 	}
@@ -307,17 +307,15 @@ func (s *mcacheShard[K, V]) collectAndClear() map[K]V {
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	toTransfer := make(map[K]V)
-	var keysToDelete []K
+	toTransfer := make(map[K]V, len(s.m))
 
+	// Deleting from a map while ranging over it is defined behavior in Go,
+	// so the collected entries can be removed in the same pass.
 	for k, v := range s.m {
-		if v.expireAt == 0 || v.expireAt >= now {
-			toTransfer[k] = v.value
-			keysToDelete = append(keysToDelete, k)
+		if v.expireAt != 0 && v.expireAt < now {
+			continue
 		}
-	}
-
-	for _, k := range keysToDelete {
+		toTransfer[k] = v.value
 		delete(s.m, k)
 	}
 
@@ -340,7 +338,7 @@ func (s *mcacheShard[K, V]) snapshot() map[K]V {
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	toCopy := make(map[K]V)
+	toCopy := make(map[K]V, len(s.m))
 
 	for k, v := range s.m {
 		if v.expireAt == 0 || v.expireAt >= now {
@@ -355,27 +353,28 @@ func (s *mcacheShard[K, V]) snapshot() map[K]V {
 // The returned slice does not include expired keys.
 // The order of keys in the slice is not guaranteed.
 func (c *MCache[K, V]) Keys() []K {
-	var keys []K
+	keys := make([]K, 0, c.Len())
 	for _, s := range c.shards {
-		keys = append(keys, s.keys()...)
+		keys = s.appendKeys(keys)
 	}
 	return keys
 }
 
-func (s *mcacheShard[K, V]) keys() []K {
+// appendKeys appends the shard's non-expired keys to dst. Appending into
+// the caller's slice avoids allocating, and then copying, a fresh slice per
+// shard.
+func (s *mcacheShard[K, V]) appendKeys(dst []K) []K {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	keys := make([]K, 0, len(s.m))
-
 	for k, v := range s.m {
 		if v.expireAt == 0 || v.expireAt >= now {
-			keys = append(keys, k)
+			dst = append(dst, k)
 		}
 	}
 
-	return keys
+	return dst
 }
 
 // expireKeys is a background goroutine that periodically checks for expired keys and removes them from the database.

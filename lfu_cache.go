@@ -268,7 +268,7 @@ func (c *LFUCache[K, V]) GetOrSetWithTimeout(k K, fn func() (V, error), timeout 
 // GetAll retrieves all key-value pairs from the cache.
 // It returns a map containing all the key-value pairs that are not expired.
 func (c *LFUCache[K, V]) GetAll() map[K]V {
-	m := make(map[K]V)
+	m := make(map[K]V, c.Len())
 	for _, s := range c.shards {
 		s.getAllInto(m)
 	}
@@ -304,21 +304,17 @@ func (s *lfuShard[K, V]) collectAndClear() map[K]V {
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	toTransfer := make(map[K]V)
-	var keysToDelete []K
+	toTransfer := make(map[K]V, len(s.items))
 
+	// Deleting from a map while ranging over it is defined behavior in Go,
+	// so the collected entries can be removed in the same pass.
 	for k, elem := range s.items {
 		item := elem.Value.(*lfuItem[K, V])
-		if item.expireAt == 0 || item.expireAt >= now {
-			toTransfer[k] = item.value
-			keysToDelete = append(keysToDelete, k)
+		if item.expireAt != 0 && item.expireAt < now {
+			continue
 		}
-	}
-
-	for _, k := range keysToDelete {
-		if elem, ok := s.items[k]; ok {
-			s.delete(k, elem)
-		}
+		toTransfer[k] = item.value
+		s.delete(k, elem)
 	}
 
 	return toTransfer
@@ -340,7 +336,7 @@ func (s *lfuShard[K, V]) snapshot() map[K]V {
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	toCopy := make(map[K]V)
+	toCopy := make(map[K]V, len(s.items))
 
 	for k, elem := range s.items {
 		item := elem.Value.(*lfuItem[K, V])
@@ -356,27 +352,28 @@ func (s *lfuShard[K, V]) snapshot() map[K]V {
 // The returned slice does not include expired keys.
 // The order of keys in the slice is not guaranteed.
 func (c *LFUCache[K, V]) Keys() []K {
-	var keys []K
+	keys := make([]K, 0, c.Len())
 	for _, s := range c.shards {
-		keys = append(keys, s.keys()...)
+		keys = s.appendKeys(keys)
 	}
 	return keys
 }
 
-func (s *lfuShard[K, V]) keys() []K {
+// appendKeys appends the shard's non-expired keys to dst. Appending into
+// the caller's slice avoids allocating, and then copying, a fresh slice per
+// shard.
+func (s *lfuShard[K, V]) appendKeys(dst []K) []K {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	keys := make([]K, 0, len(s.items))
-
 	for k, elem := range s.items {
 		item := elem.Value.(*lfuItem[K, V])
 		if item.expireAt == 0 || item.expireAt >= now {
-			keys = append(keys, k)
+			dst = append(dst, k)
 		}
 	}
-	return keys
+	return dst
 }
 
 // Purge removes all key-value pairs from the cache.
