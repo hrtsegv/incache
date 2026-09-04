@@ -1,7 +1,9 @@
 package incache
 
 import (
+	"sync"
 	"testing"
+	"time"
 )
 
 // These tests reach into shard internals to pin down invariants the public
@@ -55,5 +57,37 @@ func TestLFU_StaysWithinCapacity(t *testing.T) {
 		if l := c.Len(); l > size {
 			t.Fatalf("Len() = %d after %d operations, want <= %d", l, i+1, size)
 		}
+	}
+}
+
+// TestMCache_WritesDuringCloseAreNoOps covers the documented promise that
+// calls on a closed MCache are no-ops rather than panics. Close nils each
+// shard's map, so a writer that passed the closed check just before Close
+// ran would otherwise assign into a nil map. Most useful under -race.
+func TestMCache_WritesDuringCloseAreNoOps(t *testing.T) {
+	for attempt := 0; attempt < 200; attempt++ {
+		c := NewManual[int, int](largeCacheSize, time.Minute)
+
+		var wg sync.WaitGroup
+		for w := 0; w < 4; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < 200; i++ {
+					c.Set(w*200+i, i)
+					c.SetWithTimeout(w*200+i, i, time.Minute)
+					c.NotFoundSet(w*200+i, i)
+					c.Purge()
+				}
+			}(w)
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Close()
+		}()
+
+		wg.Wait()
 	}
 }

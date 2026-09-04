@@ -122,6 +122,13 @@ func (s *mcacheShard[K, V]) set(k K, v V, timeout time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Close nils out the map, and may have run since the caller checked the
+	// closed flag. Re-checking here, under the shard lock, is what actually
+	// makes a write racing with Close a no-op instead of a panic.
+	if s.m == nil {
+		return
+	}
+
 	var expireAt int64
 	if timeout > 0 {
 		expireAt = time.Now().Add(timeout).UnixNano()
@@ -149,6 +156,11 @@ func (s *mcacheShard[K, V]) set(k K, v V, timeout time.Duration) {
 func (s *mcacheShard[K, V]) notFoundSet(k K, v V, timeout time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// See set: guards against Close having landed since the closed check.
+	if s.m == nil {
+		return false
+	}
 
 	if val, ok := s.m[k]; ok {
 		// Check if existing key is expired
@@ -410,6 +422,11 @@ func (c *MCache[K, V]) Purge() {
 func (s *mcacheShard[K, V]) purge() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Don't hand a closed cache a fresh map to write into.
+	if s.m == nil {
+		return
+	}
 
 	s.m = make(map[K]valueWithTimeout[V])
 }
