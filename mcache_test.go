@@ -130,13 +130,13 @@ func TestGetAll(t *testing.T) {
 
 	c.Set("key1", "value1")
 	c.Set("key2", "value2")
-	c.SetWithTimeout("key3", "value3", time.Millisecond)
+	c.SetWithTimeout("key3", "value3", 50*time.Millisecond)
 
 	if m := c.GetAll(); len(m) != 3 {
 		t.Errorf("GetAll returned unexpected number of keys: %d", len(m))
 	}
 
-	time.Sleep(time.Millisecond * 2)
+	time.Sleep(80 * time.Millisecond)
 
 	if m := c.GetAll(); len(m) != 2 {
 		t.Errorf("GetAll returned unexpected number of keys: %d", len(m))

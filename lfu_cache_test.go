@@ -77,14 +77,17 @@ func TestLFUCache_EvictionByFrequency(t *testing.T) {
 func TestLFUCache_SetWithTimeout(t *testing.T) {
 	cache := NewLFU[int, string](10)
 
-	cache.SetWithTimeout(1, "one", 2*time.Millisecond)
-	time.Sleep(1 * time.Millisecond)
+	// Timings need slack in both directions: time.Sleep only ever
+	// overshoots, so a sleep meant to land inside the TTL has to be well
+	// inside it, and one meant to land past the TTL well past it.
+	cache.SetWithTimeout(1, "one", 100*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 
 	if value, ok := cache.Get(1); !ok || value != "one" {
 		t.Errorf("Expected to get 'one', got '%v'", value)
 	}
 
-	time.Sleep(2 * time.Millisecond)
+	time.Sleep(120 * time.Millisecond)
 
 	if v, ok := cache.Get(1); ok {
 		t.Logf("v: %v | ok: %v\n", v, ok)
@@ -246,13 +249,13 @@ func TestLFUCache_Count(t *testing.T) {
 
 	cache.Set(1, "one")
 	cache.Set(2, "two")
-	cache.SetWithTimeout(3, "three", time.Millisecond)
+	cache.SetWithTimeout(3, "three", 50*time.Millisecond)
 
 	if cache.Count() != 3 {
 		t.Errorf("Expected Count to be 3, got %d", cache.Count())
 	}
 
-	time.Sleep(2 * time.Millisecond)
+	time.Sleep(80 * time.Millisecond)
 
 	if cache.Count() != 2 {
 		t.Errorf("Expected Count to be 2 after expiration, got %d", cache.Count())
@@ -264,13 +267,13 @@ func TestLFUCache_Len(t *testing.T) {
 
 	cache.Set(1, "one")
 	cache.Set(2, "two")
-	cache.SetWithTimeout(3, "three", time.Millisecond)
+	cache.SetWithTimeout(3, "three", 50*time.Millisecond)
 
 	if cache.Len() != 3 {
 		t.Errorf("Expected Len to be 3, got %d", cache.Len())
 	}
 
-	time.Sleep(2 * time.Millisecond)
+	time.Sleep(80 * time.Millisecond)
 
 	// Len includes expired items
 	if cache.Len() != 3 {
