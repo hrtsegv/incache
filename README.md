@@ -219,9 +219,13 @@ Additional methods for `MCache`:
 
 ### Performance
 
-- **LRU Cache**: O(1) for Get, Set, Delete operations using a hashmap + doubly linked list
-- **LFU Cache**: O(1) for Get, Set, Delete operations using frequency buckets
-- **MCache**: O(1) for Get, Set, Delete; O(n) for eviction when cache is full
+- **LRU Cache**: O(1) for Get, Set, Delete, using a hashmap plus an intrusive doubly linked list
+- **LFU Cache**: O(1) for Get, Set, Delete, using intrusive frequency buckets
+- **MCache**: O(1) for Get, Set, Delete, including eviction when the cache is full
+
+Entries are stored as list nodes directly rather than boxed inside `container/list` elements, so a cache hit costs no allocation and no type assertion on any of the three policies.
+
+When `MCache` is full it makes room by sampling a small, fixed number of entries and dropping an expired one if the sample turns one up, falling back to an arbitrary entry otherwise. Sampling is what keeps eviction O(1); because Go randomizes where a map range starts, a short sample is a random sample of the shard.
 
 #### Sharding
 
@@ -233,12 +237,14 @@ Measured on an 11th Gen i7-11850H (`GOMAXPROCS=16`), parallel `Get`/`Set` agains
 
 | Operation | Single lock | Sharded | Speedup |
 |-----------|------------:|--------:|--------:|
-| LRU Set   | 170.6 ns/op | 42.8 ns/op | 4.0x |
-| LRU Get   | 173.5 ns/op | 35.5 ns/op | 4.9x |
-| LFU Set   | 223.4 ns/op | 57.9 ns/op | 3.9x |
-| LFU Get   | 251.1 ns/op | 56.5 ns/op | 4.4x |
-| MCache Set| 148.9 ns/op | 109.6 ns/op | 1.4x |
-| MCache Get| 103.9 ns/op | 23.0 ns/op | 4.5x |
+| LRU Set   | 455.9 ns/op | 122.8 ns/op | 3.7x |
+| LRU Get   | 512.7 ns/op |  97.1 ns/op | 5.3x |
+| LFU Set   | 640.9 ns/op | 173.6 ns/op | 3.7x |
+| LFU Get   | 671.9 ns/op | 140.3 ns/op | 4.8x |
+| MCache Set| 526.9 ns/op | 107.8 ns/op | 4.9x |
+| MCache Get| 445.1 ns/op |  59.5 ns/op | 7.5x |
+
+Both columns come from the same code, with `shardingThreshold` raised past the cache size to produce the single-lock column, and the two runs interleaved so they see the same thermal state. Absolute figures on a laptop move around a lot between runs - the ratios are the stable part.
 
 Actual gains depend on your workload's key distribution, `GOMAXPROCS`, and how contended the cache actually is - run `make bench` (or `go test -bench=. -benchmem ./...`) on your own hardware for numbers that matter to your use case.
 
