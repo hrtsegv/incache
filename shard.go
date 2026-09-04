@@ -22,6 +22,9 @@ const shardingThreshold = 1024
 // It scales with GOMAXPROCS so throughput headroom tracks the machine the
 // cache runs on, while never handing out a shard count that would leave
 // shards under-filled relative to size.
+//
+// The result is always a power of two, which is what lets shardIndexFor
+// reduce a hash with a mask instead of a division.
 func numShardsFor(size uint) int {
 	if size < shardingThreshold {
 		return 1
@@ -60,9 +63,13 @@ var shardHashSeed = maphash.MakeSeed()
 // stdlib hash over arbitrary comparable types (Go 1.24+), which is what
 // lets caches shard on a generic key type without requiring callers to
 // supply their own hash function.
+//
+// n must be a power of two, as numShardsFor guarantees; the reduction is a
+// mask rather than a modulo because a division by a runtime value costs
+// tens of cycles on every single cache operation.
 func shardIndexFor[K comparable](k K, n int) int {
 	if n == 1 {
 		return 0
 	}
-	return int(maphash.Comparable(shardHashSeed, k) % uint64(n))
+	return int(maphash.Comparable(shardHashSeed, k) & uint64(n-1))
 }

@@ -227,3 +227,41 @@ func TestMCache_EvictionPrefersExpired(t *testing.T) {
 		t.Errorf("%d of %d live entries survived eviction, want at least %d", survivors, live, live-1)
 	}
 }
+
+// TestNumShardsFor_AlwaysPowerOfTwo pins the invariant shardIndexFor relies
+// on: it reduces a hash with a mask, which is only equivalent to a modulo
+// when the shard count is a power of two.
+func TestNumShardsFor_AlwaysPowerOfTwo(t *testing.T) {
+	for _, size := range []uint{
+		0, 1, 2, 7, 100, shardingThreshold - 1, shardingThreshold,
+		shardingThreshold + 1, 5000, 100_000, 10_000_000, 1 << 40,
+	} {
+		n := numShardsFor(size)
+		if n < 1 {
+			t.Errorf("numShardsFor(%d) = %d, want >= 1", size, n)
+			continue
+		}
+		if n&(n-1) != 0 {
+			t.Errorf("numShardsFor(%d) = %d, want a power of two", size, n)
+		}
+	}
+}
+
+// TestShardIndexFor_CoversEveryShard makes sure the mask reduction actually
+// reaches every shard rather than folding keys into a subset of them.
+func TestShardIndexFor_CoversEveryShard(t *testing.T) {
+	const n = 16
+	hit := make([]bool, n)
+	for i := 0; i < 10_000; i++ {
+		idx := shardIndexFor(i, n)
+		if idx < 0 || idx >= n {
+			t.Fatalf("shardIndexFor(%d, %d) = %d, out of range", i, n, idx)
+		}
+		hit[idx] = true
+	}
+	for i, h := range hit {
+		if !h {
+			t.Errorf("shard %d never selected across 10000 keys", i)
+		}
+	}
+}
