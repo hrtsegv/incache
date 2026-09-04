@@ -58,6 +58,8 @@ type lfuShard[K comparable, V any] struct {
 	// updateMinFreq, which keeps Delete O(1) instead of making every delete
 	// that empties a bucket scan all of them.
 	minFreq uint
+
+	_ cacheLinePad
 }
 
 // NewLFU creates a new LFU cache with the specified maximum size.

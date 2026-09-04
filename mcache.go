@@ -36,6 +36,8 @@ type mcacheShard[K comparable, V any] struct {
 	mu   sync.Mutex
 	size uint
 	m    map[K]valueWithTimeout[V] // where the key-value pairs are stored
+
+	_ cacheLinePad
 }
 
 type valueWithTimeout[V any] struct {

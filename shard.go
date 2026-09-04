@@ -18,6 +18,21 @@ const maxShards = 256
 // tradeoff that only pays off at scale.
 const shardingThreshold = 1024
 
+// cacheLineSize is the cache line width on the architectures this library
+// targets (64 bytes on amd64 and arm64). It only affects padding, so being
+// wrong on an exotic architecture costs a little memory, never correctness.
+const cacheLineSize = 64
+
+// cacheLinePad is embedded at the end of every shard struct so that two
+// shards allocated back to back can never share a cache line. Without it
+// the hot fields of several shards (each only a few words wide) land in one
+// line, and a write to one shard's mutex invalidates that line for every
+// core working on the others - false sharing that shows up precisely in the
+// concurrent workloads sharding exists to speed up.
+type cacheLinePad struct {
+	_ [cacheLineSize]byte
+}
+
 // numShardsFor picks how many shards a cache of the given size should use.
 // It scales with GOMAXPROCS so throughput headroom tracks the machine the
 // cache runs on, while never handing out a shard count that would leave

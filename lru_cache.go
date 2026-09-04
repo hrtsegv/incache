@@ -46,6 +46,8 @@ type lruShard[K comparable, V any] struct {
 	// head.prev is the least recently used entry - the eviction candidate -
 	// and no sentinel node is needed. A nil head means the shard is empty.
 	head *lruEntry[K, V]
+
+	_ cacheLinePad
 }
 
 // NewLRU creates a new LRU cache with the specified maximum size.
