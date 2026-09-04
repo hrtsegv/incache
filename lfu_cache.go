@@ -161,14 +161,21 @@ func (s *lfuShard[K, V]) incrementFreq(elem *list.Element) {
 	oldFreq := item.freq
 	newFreq := oldFreq + 1
 
-	// Remove from old frequency list
+	// Remove from old frequency list. An emptied list must always be
+	// dropped, not just when it emptied at the minimum frequency: a key
+	// climbing past a colder one empties a list on every access, and
+	// leaving those behind grows freqLists with the number of accesses
+	// rather than with the number of items.
 	oldList := s.freqLists[oldFreq]
 	oldList.Remove(elem)
 
-	// Update minFreq if necessary
-	if oldFreq == s.minFreq && oldList.Len() == 0 {
-		s.minFreq = newFreq
+	if oldList.Len() == 0 {
 		delete(s.freqLists, oldFreq)
+		// Nothing is left at oldFreq, and this item is about to land at
+		// oldFreq+1, so that is the new minimum.
+		if oldFreq == s.minFreq {
+			s.minFreq = newFreq
+		}
 	}
 
 	// Add to new frequency list
@@ -443,6 +450,12 @@ func (s *lfuShard[K, V]) deleteKey(k K) {
 }
 
 // delete assumes s.mu is already held by the caller.
+//
+// It deliberately leaves minFreq alone. minFreq is only ever a starting
+// point for eviction, which repairs it if it has gone stale, so removing an
+// item does not need to pay for a scan of every bucket - it only has to
+// leave minFreq at or below the true minimum, which removing an item
+// always does.
 func (s *lfuShard[K, V]) delete(key K, elem *list.Element) {
 	item := elem.Value.(*lfuItem[K, V])
 	freq := item.freq
@@ -453,16 +466,16 @@ func (s *lfuShard[K, V]) delete(key K, elem *list.Element) {
 		freqList.Remove(elem)
 		if freqList.Len() == 0 {
 			delete(s.freqLists, freq)
-			// Update minFreq if necessary
-			if freq == s.minFreq {
-				s.updateMinFreq()
-			}
 		}
 	}
 
 	delete(s.items, key)
 }
 
+// updateMinFreq resets minFreq to the smallest live frequency. Because
+// emptied lists are never left in freqLists, the frequency it picks always
+// has an item to evict.
+// It assumes s.mu is already held by the caller.
 func (s *lfuShard[K, V]) updateMinFreq() {
 	s.minFreq = 0
 	for freq := range s.freqLists {
@@ -475,12 +488,14 @@ func (s *lfuShard[K, V]) updateMinFreq() {
 // evict removes n items with the lowest frequency - O(1) per item
 func (s *lfuShard[K, V]) evict(n int) {
 	for i := 0; i < n && len(s.items) > 0; i++ {
-		// Get the list with minimum frequency
+		// Get the list with minimum frequency. Every list in freqLists has
+		// items in it, so a hit here is always evictable; a miss just means
+		// minFreq is a lower bound that deletions have left behind.
 		minList := s.freqLists[s.minFreq]
-		if minList == nil || minList.Len() == 0 {
+		if minList == nil {
 			s.updateMinFreq()
 			minList = s.freqLists[s.minFreq]
-			if minList == nil || minList.Len() == 0 {
+			if minList == nil {
 				return
 			}
 		}
